@@ -1,0 +1,1 @@
+# ks_factset_research_v3
