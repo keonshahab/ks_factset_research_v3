@@ -108,33 +108,39 @@ display(sa_df.limit(10))
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
 
 edg_string_cols = [
     field.name for field in edg_df.schema.fields
-    if str(field.dataType) == "StringType"
+    if isinstance(field.dataType, StringType)
 ]
 
 print(f"String columns in edg_metadata ({len(edg_string_cols)}):")
 print(edg_string_cols)
 print()
 
-edg_profile_exprs = []
-for col_name in edg_string_cols:
-    edg_profile_exprs.extend([
-        F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
-        F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
-    ])
+if edg_string_cols:
+    edg_profile_exprs = []
+    for col_name in edg_string_cols:
+        edg_profile_exprs.extend([
+            F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
+            F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
+        ])
 
-edg_profile = edg_df.select(edg_profile_exprs).collect()[0]
+    edg_profile = edg_df.select(edg_profile_exprs).collect()[0]
 
-print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
-print("-" * 66)
-for col_name in edg_string_cols:
-    avg_len = edg_profile[f"{col_name}__avg_len"]
-    max_len = edg_profile[f"{col_name}__max_len"]
-    avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
-    max_display = f"{max_len:,}" if max_len is not None else "NULL"
-    print(f"{col_name:<40} {avg_display:>12} {max_display:>12}")
+    print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
+    print("-" * 66)
+    for col_name in edg_string_cols:
+        avg_len = edg_profile[f"{col_name}__avg_len"]
+        max_len = edg_profile[f"{col_name}__max_len"]
+        avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
+        max_display = f"{max_len:,}" if max_len is not None else "NULL"
+        print(f"{col_name:<40} {avg_display:>12} {max_display:>12}")
+else:
+    print("No StringType columns found. Printing all column types for inspection:")
+    for field in edg_df.schema.fields:
+        print(f"  {field.name:<40} {str(field.dataType)}")
 
 # COMMAND ----------
 
@@ -158,40 +164,46 @@ else:
 
 fcst_string_cols = [
     field.name for field in fcst_df.schema.fields
-    if str(field.dataType) == "StringType"
+    if isinstance(field.dataType, StringType)
 ]
 
 print(f"String columns in fcst_metadata ({len(fcst_string_cols)}):")
 print(fcst_string_cols)
 print()
 
-fcst_profile_exprs = []
-for col_name in fcst_string_cols:
-    fcst_profile_exprs.extend([
-        F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
-        F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
-    ])
-
-fcst_profile = fcst_df.select(fcst_profile_exprs).collect()[0]
-
-print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
-print("-" * 66)
 best_fcst_col = None
 best_fcst_avg = 0
-for col_name in fcst_string_cols:
-    avg_len = fcst_profile[f"{col_name}__avg_len"]
-    max_len = fcst_profile[f"{col_name}__max_len"]
-    avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
-    max_display = f"{max_len:,}" if max_len is not None else "NULL"
-    marker = ""
-    if avg_len is not None and avg_len > best_fcst_avg:
-        best_fcst_avg = avg_len
-        best_fcst_col = col_name
-        marker = " <-- candidate"
-    print(f"{col_name:<40} {avg_display:>12} {max_display:>12}{marker}")
 
-print()
-print(f">>> Best candidate text body column: {best_fcst_col} (avg length {best_fcst_avg:,.1f})")
+if fcst_string_cols:
+    fcst_profile_exprs = []
+    for col_name in fcst_string_cols:
+        fcst_profile_exprs.extend([
+            F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
+            F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
+        ])
+
+    fcst_profile = fcst_df.select(fcst_profile_exprs).collect()[0]
+
+    print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
+    print("-" * 66)
+    for col_name in fcst_string_cols:
+        avg_len = fcst_profile[f"{col_name}__avg_len"]
+        max_len = fcst_profile[f"{col_name}__max_len"]
+        avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
+        max_display = f"{max_len:,}" if max_len is not None else "NULL"
+        marker = ""
+        if avg_len is not None and avg_len > best_fcst_avg:
+            best_fcst_avg = avg_len
+            best_fcst_col = col_name
+            marker = " <-- candidate"
+        print(f"{col_name:<40} {avg_display:>12} {max_display:>12}{marker}")
+
+    print()
+    print(f">>> Best candidate text body column: {best_fcst_col} (avg length {best_fcst_avg:,.1f})")
+else:
+    print("No StringType columns found. Printing all column types for inspection:")
+    for field in fcst_df.schema.fields:
+        print(f"  {field.name:<40} {str(field.dataType)}")
 
 # COMMAND ----------
 
@@ -216,45 +228,51 @@ for col_name in fcst_string_cols:
 
 sa_string_cols = [
     field.name for field in sa_df.schema.fields
-    if str(field.dataType) == "StringType"
+    if isinstance(field.dataType, StringType)
 ]
 
 print(f"String columns in sa_metadata ({len(sa_string_cols)}):")
 print(sa_string_cols)
 print()
 
-sa_profile_exprs = []
-for col_name in sa_string_cols:
-    sa_profile_exprs.extend([
-        F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
-        F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
-    ])
-
-sa_profile = sa_df.select(sa_profile_exprs).collect()[0]
-
-print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
-print("-" * 66)
 best_sa_col = None
 best_sa_avg = 0
-for col_name in sa_string_cols:
-    avg_len = sa_profile[f"{col_name}__avg_len"]
-    max_len = sa_profile[f"{col_name}__max_len"]
-    avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
-    max_display = f"{max_len:,}" if max_len is not None else "NULL"
-    marker = ""
-    if avg_len is not None and avg_len > best_sa_avg:
-        best_sa_avg = avg_len
-        best_sa_col = col_name
-        marker = " <-- candidate"
-    print(f"{col_name:<40} {avg_display:>12} {max_display:>12}{marker}")
 
-print()
-if best_sa_col and best_sa_avg > 100:
-    print(f">>> Best candidate text body column: {best_sa_col} (avg length {best_sa_avg:,.1f})")
+if sa_string_cols:
+    sa_profile_exprs = []
+    for col_name in sa_string_cols:
+        sa_profile_exprs.extend([
+            F.avg(F.length(F.col(col_name))).alias(f"{col_name}__avg_len"),
+            F.max(F.length(F.col(col_name))).alias(f"{col_name}__max_len"),
+        ])
+
+    sa_profile = sa_df.select(sa_profile_exprs).collect()[0]
+
+    print(f"{'Column':<40} {'Avg Length':>12} {'Max Length':>12}")
+    print("-" * 66)
+    for col_name in sa_string_cols:
+        avg_len = sa_profile[f"{col_name}__avg_len"]
+        max_len = sa_profile[f"{col_name}__max_len"]
+        avg_display = f"{avg_len:,.1f}" if avg_len is not None else "NULL"
+        max_display = f"{max_len:,}" if max_len is not None else "NULL"
+        marker = ""
+        if avg_len is not None and avg_len > best_sa_avg:
+            best_sa_avg = avg_len
+            best_sa_col = col_name
+            marker = " <-- candidate"
+        print(f"{col_name:<40} {avg_display:>12} {max_display:>12}{marker}")
+
+    print()
+    if best_sa_col and best_sa_avg > 100:
+        print(f">>> Best candidate text body column: {best_sa_col} (avg length {best_sa_avg:,.1f})")
+    else:
+        print(">>> WARNING: No string column with avg length > 100 found.")
+        print(">>> The SA table may NOT contain body text — only metadata + headline.")
+        print(f">>> Longest avg string column: {best_sa_col} (avg length {best_sa_avg:,.1f})")
 else:
-    print(">>> WARNING: No string column with avg length > 100 found.")
-    print(">>> The SA table may NOT contain body text — only metadata + headline.")
-    print(f">>> Longest avg string column: {best_sa_col} (avg length {best_sa_avg:,.1f})")
+    print("No StringType columns found. Printing all column types for inspection:")
+    for field in sa_df.schema.fields:
+        print(f"  {field.name:<40} {str(field.dataType)}")
 
 # COMMAND ----------
 
