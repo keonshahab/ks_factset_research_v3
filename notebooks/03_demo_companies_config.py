@@ -121,7 +121,11 @@ print(f"Companies to seed: {len(COMPANIES)}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3a — Lookup entity_id and fsym_id from ticker_entity_map
+# MAGIC ### 3a — Lookup entity_id and fsym_id
+# MAGIC
+# MAGIC First try `ticker_entity_map`. For any tickers not found there, fall back to
+# MAGIC a direct query against the FactSet symbology tables (the same sources used
+# MAGIC by Notebook 02, but with a targeted filter on our 20 tickers).
 
 # COMMAND ----------
 
@@ -136,10 +140,43 @@ entity_lookup = (
 
 entity_map = {row["ticker_region"]: row for row in entity_lookup.collect()}
 
-print(f"Entity map matches: {len(entity_map)} / {len(ticker_regions)}")
+found_tem = len(entity_map)
+print(f"ticker_entity_map matches: {found_tem} / {len(ticker_regions)}")
+
+# COMMAND ----------
+
+# Fallback: query FactSet symbology tables directly for missing tickers
+missing_tickers = [tr for tr in ticker_regions if tr not in entity_map]
+
+if missing_tickers:
+    print(f"Falling back to FactSet symbology tables for {len(missing_tickers)} tickers...")
+
+    missing_list_sql = ", ".join(f"'{t}'" for t in missing_tickers)
+    fallback_df = spark.sql(f"""
+        SELECT
+            tr.TICKER_REGION       AS ticker_region,
+            ese.FACTSET_ENTITY_ID  AS entity_id,
+            tr.FSYM_ID             AS fsym_id
+        FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region tr
+        JOIN delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity ese
+            ON regexp_extract(tr.FSYM_ID, '^(.+)-', 1)
+             = regexp_extract(ese.FSYM_ID, '^(.+)-', 1)
+        WHERE tr.TICKER_REGION IN ({missing_list_sql})
+    """)
+
+    fallback_rows = fallback_df.dropDuplicates(["ticker_region"]).collect()
+    for row in fallback_rows:
+        entity_map[row["ticker_region"]] = row
+
+    found_fallback = len(fallback_rows)
+    print(f"Fallback matches: {found_fallback} / {len(missing_tickers)}")
+else:
+    found_fallback = 0
+
+print(f"\nTotal resolved: {len(entity_map)} / {len(ticker_regions)}")
 for tr in ticker_regions:
     if tr not in entity_map:
-        print(f"  WARNING: {tr} not found in ticker_entity_map")
+        print(f"  WARNING: {tr} — no entity_id / fsym_id found anywhere")
 
 # COMMAND ----------
 
