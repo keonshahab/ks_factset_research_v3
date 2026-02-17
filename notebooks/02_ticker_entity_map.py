@@ -118,17 +118,41 @@ display(
 
 # COMMAND ----------
 
-tr_fsym  = tr_df.select("FSYM_ID").distinct()
-ese_fsym = ese_df.select("FSYM_ID").distinct()
+# Show sample FSYM_ID from each table to compare formats
+print("=== FSYM_ID samples ===\n")
+print("sym_ticker_region (first 5):")
+for row in tr_df.select("FSYM_ID").limit(5).collect():
+    print(f"  {row['FSYM_ID']}")
 
-overlap_1 = tr_fsym.join(ese_fsym, "FSYM_ID", "inner").count()
-print(f"FSYM_ID overlap  (sym_ticker_region ∩ ent_scr_sec_entity): {overlap_1:,}")
+print("\nent_scr_sec_entity (first 5):")
+for row in ese_df.select("FSYM_ID").limit(5).collect():
+    print(f"  {row['FSYM_ID']}")
 
-ese_entity = ese_df.select("FACTSET_ENTITY_ID").distinct()
-se_entity  = se_df.select("FACTSET_ENTITY_ID").distinct()
+# Check base-ID overlap (strip suffix after last hyphen)
+tr_base  = tr_df.select(F.regexp_extract("FSYM_ID", r"^(.+)-", 1).alias("base_id")).distinct()
+ese_base = ese_df.select(F.regexp_extract("FSYM_ID", r"^(.+)-", 1).alias("base_id")).distinct()
 
-overlap_2 = ese_entity.join(se_entity, "FACTSET_ENTITY_ID", "inner").count()
-print(f"ENTITY_ID overlap (ent_scr_sec_entity ∩ sym_entity):       {overlap_2:,}")
+base_overlap = tr_base.join(ese_base, "base_id", "inner").count()
+print(f"\nBase-ID overlap (strip suffix): {base_overlap:,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.6 — Available Tables in sym_v1 and ent_v1
+# MAGIC
+# MAGIC Find the bridge table that links regional (`-R`) to security (`-S`) FSYM_IDs.
+
+# COMMAND ----------
+
+print("=== Tables in sym_v1 ===")
+sym_tables = spark.sql("SHOW TABLES IN delta_share_factset_do_not_delete_or_edit.sym_v1").collect()
+for row in sym_tables:
+    print(f"  {row['tableName']}")
+
+print("\n=== Tables in ent_v1 ===")
+ent_tables = spark.sql("SHOW TABLES IN delta_share_factset_do_not_delete_or_edit.ent_v1").collect()
+for row in ent_tables:
+    print(f"  {row['tableName']}")
 
 # COMMAND ----------
 
