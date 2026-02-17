@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
-# MAGIC | 1 | Create Vector Search endpoint |
+# MAGIC | 1 | Parameters & verify Vector Search endpoint |
 # MAGIC | 2 | Create 3 Delta Sync indexes (managed embeddings) |
 # MAGIC | 3 | Trigger sync and poll until ONLINE |
 # MAGIC | 4 | Test each index with `query_text` |
@@ -23,7 +23,11 @@
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 1: Create Vector Search Endpoint
+# MAGIC ## Step 1: Parameters & Verify Endpoint
+
+# COMMAND ----------
+
+dbutils.widgets.text("vs_endpoint", "one-env-shared-endpoint-11", "Vector Search endpoint name")
 
 # COMMAND ----------
 
@@ -34,35 +38,20 @@ vsc = VectorSearchClient()
 
 # COMMAND ----------
 
-ENDPOINT_NAME = "ks_factset_research_v3_vs_endpoint"
+ENDPOINT_NAME = dbutils.widgets.get("vs_endpoint").strip()
 CATALOG = "ks_factset_research_v3"
 SCHEMA = "demo"
 EMBEDDING_MODEL = "databricks-gte-large-en"
 
-# COMMAND ----------
-
-# Create endpoint (no-op if it already exists)
-try:
-    endpoint_info = vsc.get_endpoint(ENDPOINT_NAME)
-    print(f"Endpoint '{ENDPOINT_NAME}' already exists — status: {endpoint_info.get('endpoint_status', {}).get('state', 'UNKNOWN')}")
-except Exception:
-    print(f"Creating endpoint '{ENDPOINT_NAME}' ...")
-    vsc.create_endpoint(name=ENDPOINT_NAME)
-    print(f"Endpoint '{ENDPOINT_NAME}': CREATE requested")
+print(f"Endpoint: {ENDPOINT_NAME}")
 
 # COMMAND ----------
 
-# Wait for endpoint to be ready
-for i in range(60):
-    ep = vsc.get_endpoint(ENDPOINT_NAME)
-    state = ep.get("endpoint_status", {}).get("state", "UNKNOWN")
-    if state == "ONLINE":
-        print(f"Endpoint '{ENDPOINT_NAME}' is ONLINE")
-        break
-    print(f"  [{i+1}] Endpoint state: {state} — waiting 30s ...")
-    time.sleep(30)
-else:
-    raise TimeoutError(f"Endpoint '{ENDPOINT_NAME}' did not reach ONLINE state within 30 minutes")
+# Verify shared endpoint is online
+endpoint_info = vsc.get_endpoint(ENDPOINT_NAME)
+ep_state = endpoint_info.get("endpoint_status", {}).get("state", "UNKNOWN")
+print(f"Endpoint '{ENDPOINT_NAME}' — status: {ep_state}")
+assert ep_state == "ONLINE", f"Shared endpoint is not ONLINE (state: {ep_state}). Contact your workspace admin."
 
 # COMMAND ----------
 
@@ -444,6 +433,7 @@ print("DONE")
 # MAGIC from databricks.vector_search.client import VectorSearchClient
 # MAGIC vsc = VectorSearchClient()
 # MAGIC
+# MAGIC ENDPOINT = dbutils.widgets.get("vs_endpoint").strip()
 # MAGIC index_names = [
 # MAGIC     "ks_factset_research_v3.demo.filing_search_index",
 # MAGIC     "ks_factset_research_v3.demo.earnings_search_index",
@@ -451,6 +441,6 @@ print("DONE")
 # MAGIC ]
 # MAGIC
 # MAGIC for idx in index_names:
-# MAGIC     vsc.get_index("ks_factset_research_v3_vs_endpoint", idx).sync()
+# MAGIC     vsc.get_index(ENDPOINT, idx).sync()
 # MAGIC     print(f"Sync triggered: {idx}")
 # MAGIC ```
