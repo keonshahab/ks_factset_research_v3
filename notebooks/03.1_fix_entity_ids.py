@@ -11,15 +11,14 @@
 # MAGIC identifiers. `dropDuplicates` then picked arbitrary wrong rows.
 # MAGIC
 # MAGIC **Resolution strategy (in priority order):**
-# MAGIC 1. **Crosswalk table** — `ks_position_sample.vendor_data.factset_symbology_xref`
-# MAGIC    has curated `ticker_region → factset_entity_id` mappings
-# MAGIC 2. **Name search** — search `sym_entity` by company name + `ENTITY_TYPE = 'PUB'`
+# MAGIC 1. **Name search** — search `sym_entity` by full proper name + `PUB` + `US`
+# MAGIC 2. **Crosswalk table** — fallback, strict validation (non-NULL + PUB + name match)
 # MAGIC 3. **fsym_id** — read directly from `sym_ticker_region` (no entity join needed)
 # MAGIC
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
 # MAGIC | 1 | Detect mismatches: compare resolved name vs display_name |
-# MAGIC | 2 | Resolve correct entity_ids (crosswalk → name search) |
+# MAGIC | 2 | Resolve correct entity_ids (name search → crosswalk fallback) |
 # MAGIC | 3 | Update demo_companies config table |
 # MAGIC | 4 | Rebuild company_profile |
 # MAGIC | 5 | Validate — confirm all names match |
@@ -58,10 +57,19 @@ print("-" * 100)
 mismatches = []
 for row in rows:
     display = row["display_name"] or ""
-    resolved = row["resolved_name"] or "(NULL)"
-    match = display.lower() in resolved.lower() or resolved.lower() in display.lower()
+    resolved = row["resolved_name"]  # keep as None if NULL
+    resolved_str = resolved or "(NULL)"
+    entity_type = row["resolved_type"] or "N/A"
+
+    # A mapping is correct only if the resolved name is non-NULL, is a PUB
+    # entity, and the display name appears in it (or vice-versa).
+    if resolved and entity_type == "PUB":
+        match = display.lower() in resolved.lower() or resolved.lower() in display.lower()
+    else:
+        match = False  # NULL or non-PUB = always a mismatch
+
     flag = "OK" if match else "MISMATCH"
-    print(f"{row['ticker']:<8} {display:<25} {resolved:<35} {row['resolved_type'] or 'N/A':<6} {flag}")
+    print(f"{row['ticker']:<8} {display:<25} {resolved_str:<35} {entity_type:<6} {flag}")
     if not match:
         mismatches.append(row)
 
@@ -349,8 +357,15 @@ print("-" * 100)
 remaining_mismatches = 0
 for row in val_rows:
     display = (row["display_name"] or "").lower()
-    resolved = (row["resolved_name"] or "").lower()
-    match = display in resolved or resolved in display
+    resolved = row["resolved_name"]
+    entity_type = row["resolved_type"] or ""
+
+    # Correct = non-NULL PUB entity whose name matches display_name
+    if resolved and entity_type == "PUB":
+        match = display in resolved.lower() or resolved.lower() in display
+    else:
+        match = False
+
     flag = "OK" if match else "MISMATCH"
     if not match:
         remaining_mismatches += 1
