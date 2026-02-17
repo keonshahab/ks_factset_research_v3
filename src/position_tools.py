@@ -1,5 +1,5 @@
 """
-Position tools — structured queries against ks_position_sample.* tables (cross-catalog).
+Position tools — cross-catalog queries for position book data.
 
 Every public function returns a dict with three keys:
     result            – the computed answer (number, dict, or list)
@@ -8,7 +8,11 @@ Every public function returns a dict with three keys:
 
 Ticker resolution: accepts a short ticker (e.g. "NVDA") and resolves it to
 ticker_region (e.g. "NVDA-US") via the demo_companies config table, then
-checks the position crosswalk to confirm the ticker is in the book.
+checks the position crosswalk (ks_position_sample) to confirm the ticker is
+in the book.
+
+Position data tables live in ks_factset_research_v3.gold and are seeded by
+the test notebook (09c).  The crosswalk lives in ks_position_sample.
 
 Usage (in a Databricks notebook):
     from src.position_tools import get_firm_exposure
@@ -27,15 +31,18 @@ from typing import Any, Dict, List, Optional
 
 POSITION_CATALOG = "ks_position_sample"
 RESEARCH_CATALOG = "ks_factset_research_v3"
+SCHEMA = "gold"
 
-# Cross-catalog position tables
+# Cross-catalog: position-book membership (ks_position_sample)
 XREF_TABLE = f"{POSITION_CATALOG}.vendor_data.factset_symbology_xref"
-POSITIONS_TABLE = f"{POSITION_CATALOG}.positions.current_positions"
-PNL_TABLE = f"{POSITION_CATALOG}.positions.daily_pnl"
-RISK_TABLE = f"{POSITION_CATALOG}.risk.compliance_flags"
 
-# Research catalog lookup
-DEMO_COMPANIES = f"{RESEARCH_CATALOG}.gold.demo_companies"
+# Position data tables (ks_factset_research_v3.gold)
+POSITIONS_TABLE = f"{RESEARCH_CATALOG}.{SCHEMA}.position_exposures"
+PNL_TABLE = f"{RESEARCH_CATALOG}.{SCHEMA}.position_pnl"
+RISK_TABLE = f"{RESEARCH_CATALOG}.{SCHEMA}.position_risk_flags"
+
+# Lookup
+DEMO_COMPANIES = f"{RESEARCH_CATALOG}.{SCHEMA}.demo_companies"
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +53,16 @@ def _query(spark, sql: str) -> List[Dict[str, Any]]:
     """Run *sql* via Spark and return a list of row-dicts."""
     rows = spark.sql(sql).collect()
     return [row.asDict() for row in rows]
+
+
+def _safe_query(spark, sql: str) -> List[Dict[str, Any]]:
+    """Like _query but returns [] if the table does not exist."""
+    try:
+        return _query(spark, sql)
+    except Exception as exc:
+        if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+            return []
+        raise
 
 
 def _fmt(value: Optional[float], suffix: str = "", is_ratio: bool = False) -> str:
@@ -83,7 +100,7 @@ def _resolve_ticker_region(spark, ticker: str) -> Optional[str]:
     Returns None if the ticker is not found anywhere.
     """
     # Try demo_companies first (fast, small table)
-    rows = _query(spark, f"""
+    rows = _safe_query(spark, f"""
         SELECT ticker_region
         FROM {DEMO_COMPANIES}
         WHERE ticker = '{ticker}'
@@ -93,7 +110,7 @@ def _resolve_ticker_region(spark, ticker: str) -> Optional[str]:
         return rows[0]["ticker_region"]
 
     # Fallback: check xref table (ticker_region format is "TICKER-REGION")
-    rows = _query(spark, f"""
+    rows = _safe_query(spark, f"""
         SELECT ticker_region
         FROM {XREF_TABLE}
         WHERE ticker_region LIKE '{ticker}-%'
@@ -107,7 +124,7 @@ def _resolve_ticker_region(spark, ticker: str) -> Optional[str]:
 
 def _check_in_position_book(spark, ticker_region: str) -> bool:
     """Check if a ticker_region exists in the position crosswalk."""
-    rows = _query(spark, f"""
+    rows = _safe_query(spark, f"""
         SELECT 1
         FROM {XREF_TABLE}
         WHERE ticker_region = '{ticker_region}'
@@ -165,14 +182,13 @@ def get_firm_exposure(
     steps.append(f"Confirmed {ticker_region} is in position book")
 
     # Total notional
-    total_sql = f"""
+    total_rows = _safe_query(spark, f"""
         SELECT SUM(notional) AS total_notional,
                COUNT(*) AS position_count
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
-    """
-    total_rows = _query(spark, total_sql)
+    """)
     total = total_rows[0] if total_rows else {}
     total_notional = total.get("total_notional")
     position_count = total.get("position_count", 0)
@@ -181,7 +197,7 @@ def get_firm_exposure(
     steps.append(f"Total notional: {_fmt(total_notional)}, positions: {position_count}")
 
     # Breakdown by desk
-    desk_rows = _query(spark, f"""
+    desk_rows = _safe_query(spark, f"""
         SELECT desk,
                SUM(notional) AS notional,
                COUNT(*) AS positions
@@ -193,7 +209,7 @@ def get_firm_exposure(
     """)
 
     # Breakdown by asset_class
-    ac_rows = _query(spark, f"""
+    ac_rows = _safe_query(spark, f"""
         SELECT asset_class,
                SUM(notional) AS notional,
                COUNT(*) AS positions
@@ -205,7 +221,7 @@ def get_firm_exposure(
     """)
 
     # Breakdown by book_type
-    bt_rows = _query(spark, f"""
+    bt_rows = _safe_query(spark, f"""
         SELECT book_type,
                SUM(notional) AS notional,
                COUNT(*) AS positions
@@ -288,7 +304,7 @@ def get_desk_pnl(
     steps.append(f"Confirmed {ticker_region} is in position book")
 
     # Daily detail (last N days relative to most recent date in the table)
-    detail_sql = f"""
+    rows = _safe_query(spark, f"""
         SELECT desk,
                pnl_date,
                daily_pnl,
@@ -302,8 +318,7 @@ def get_desk_pnl(
               WHERE ticker_region = '{ticker_region}'
           )
         ORDER BY pnl_date DESC, desk
-    """
-    rows = _query(spark, detail_sql)
+    """)
     steps.append(f"Queried {PNL_TABLE} for last {days} days: {len(rows)} rows")
 
     if not rows:
@@ -322,7 +337,7 @@ def get_desk_pnl(
         }
 
     # Aggregate by desk
-    desk_summary = _query(spark, f"""
+    desk_summary = _safe_query(spark, f"""
         SELECT desk,
                SUM(daily_pnl) AS total_pnl,
                MIN(daily_pnl) AS worst_day,
@@ -394,14 +409,13 @@ def get_risk_flags(spark, ticker: str) -> Dict[str, Any]:
 
     steps.append(f"Confirmed {ticker_region} is in position book")
 
-    sql = f"""
+    rows = _safe_query(spark, f"""
         SELECT *
         FROM {RISK_TABLE}
         WHERE ticker_region = '{ticker_region}'
         ORDER BY flag_date DESC
         LIMIT 1
-    """
-    rows = _query(spark, sql)
+    """)
     steps.append(f"Queried {RISK_TABLE} for {ticker_region}")
 
     if not rows:
@@ -469,7 +483,7 @@ def get_position_summary(spark, ticker: str) -> Dict[str, Any]:
     steps.append(f"Confirmed {ticker_region} is in position book")
 
     # Find the most recent position date
-    date_rows = _query(spark, f"""
+    date_rows = _safe_query(spark, f"""
         SELECT MAX(position_date) AS max_date
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
@@ -484,7 +498,7 @@ def get_position_summary(spark, ticker: str) -> Dict[str, Any]:
                 "in_position_book": True,
                 "message": "No position data found",
             },
-            "calculation_steps": steps + ["No position rows found in current_positions"],
+            "calculation_steps": steps + [f"No position rows found in {POSITIONS_TABLE}"],
             "sources": [POSITIONS_TABLE, XREF_TABLE, DEMO_COMPANIES],
         }
 
@@ -500,7 +514,7 @@ def get_position_summary(spark, ticker: str) -> Dict[str, Any]:
     steps.extend(risk["calculation_steps"][1:])  # skip duplicate resolve step
 
     # Top 10 positions by absolute notional
-    top10_rows = _query(spark, f"""
+    top10_rows = _safe_query(spark, f"""
         SELECT desk, asset_class, book_type, notional, market_value,
                quantity, currency, strategy
         FROM {POSITIONS_TABLE}
@@ -568,7 +582,7 @@ def get_desk_positions(
     steps.append(f"Confirmed {ticker_region} is in position book")
 
     # Find the most recent position date for this desk
-    date_rows = _query(spark, f"""
+    date_rows = _safe_query(spark, f"""
         SELECT MAX(position_date) AS max_date
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
@@ -594,7 +608,7 @@ def get_desk_positions(
     steps.append(f"Most recent position date for desk '{desk}': {as_of_date}")
 
     # Full detail for this desk
-    rows = _query(spark, f"""
+    rows = _safe_query(spark, f"""
         SELECT desk, asset_class, book_type, notional, market_value,
                quantity, currency, strategy, position_date
         FROM {POSITIONS_TABLE}
