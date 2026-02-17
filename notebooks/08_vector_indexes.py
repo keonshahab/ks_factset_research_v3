@@ -11,6 +11,10 @@
 # MAGIC - Chunk tables exist with `delta.enableChangeDataFeed = true` (Notebooks 04–06)
 # MAGIC - Unity Catalog enabled
 # MAGIC
+# MAGIC **Parameters:**
+# MAGIC - `vs_endpoint` — Vector Search endpoint name
+# MAGIC - `force_recreate` — Set to `yes` to delete and rebuild all indexes (use after `CREATE OR REPLACE TABLE` on chunk tables)
+# MAGIC
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
 # MAGIC | 1 | Parameters & verify Vector Search endpoint |
@@ -33,6 +37,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("vs_endpoint", "one-env-shared-endpoint-11", "Vector Search endpoint name")
+dbutils.widgets.dropdown("force_recreate", "no", ["no", "yes"], "Force delete & recreate indexes")
 
 # COMMAND ----------
 
@@ -47,8 +52,11 @@ ENDPOINT_NAME = dbutils.widgets.get("vs_endpoint").strip()
 CATALOG = "ks_factset_research_v3"
 SCHEMA = "demo"
 EMBEDDING_MODEL = "databricks-gte-large-en"
+FORCE_RECREATE = dbutils.widgets.get("force_recreate").strip().lower() == "yes"
 
 print(f"Endpoint: {ENDPOINT_NAME}")
+if FORCE_RECREATE:
+    print("FORCE RECREATE mode — existing indexes will be deleted and rebuilt")
 
 # COMMAND ----------
 
@@ -101,22 +109,41 @@ FILING_SYNC_COLS = [
     "token_count",
 ]
 
-try:
-    vsc.get_index(ENDPOINT_NAME, FILING_INDEX).describe()
-    print(f"Index '{FILING_INDEX}' already exists — skipping creation")
-except Exception:
-    print(f"Creating index '{FILING_INDEX}' ...")
-    vsc.create_delta_sync_index(
-        endpoint_name=ENDPOINT_NAME,
-        index_name=FILING_INDEX,
-        source_table_name=FILING_SOURCE,
-        primary_key="chunk_id",
-        pipeline_type="TRIGGERED",
-        embedding_source_column="chunk_text",
-        embedding_model_endpoint_name=EMBEDDING_MODEL,
-        columns_to_sync=FILING_SYNC_COLS,
-    )
-    print(f"Index '{FILING_INDEX}': CREATE requested")
+def _create_or_recreate_index(index_name, source_table, sync_cols):
+    """Create index, optionally deleting first if FORCE_RECREATE is set."""
+    exists = False
+    try:
+        vsc.get_index(ENDPOINT_NAME, index_name).describe()
+        exists = True
+    except Exception:
+        pass
+
+    if exists and FORCE_RECREATE:
+        print(f"Deleting existing index '{index_name}' for recreation ...")
+        vsc.delete_index(ENDPOINT_NAME, index_name)
+        # Wait for deletion to propagate
+        time.sleep(10)
+        exists = False
+
+    if exists:
+        print(f"Index '{index_name}' already exists — skipping creation")
+    else:
+        print(f"Creating index '{index_name}' ...")
+        vsc.create_delta_sync_index(
+            endpoint_name=ENDPOINT_NAME,
+            index_name=index_name,
+            source_table_name=source_table,
+            primary_key="chunk_id",
+            pipeline_type="TRIGGERED",
+            embedding_source_column="chunk_text",
+            embedding_model_endpoint_name=EMBEDDING_MODEL,
+            columns_to_sync=sync_cols,
+        )
+        print(f"Index '{index_name}': CREATE requested")
+
+# COMMAND ----------
+
+_create_or_recreate_index(FILING_INDEX, FILING_SOURCE, FILING_SYNC_COLS)
 
 # COMMAND ----------
 
@@ -157,22 +184,7 @@ print(f"Earnings sync columns ({len(EARNINGS_SYNC_COLS)}): {EARNINGS_SYNC_COLS}"
 
 # COMMAND ----------
 
-try:
-    vsc.get_index(ENDPOINT_NAME, EARNINGS_INDEX).describe()
-    print(f"Index '{EARNINGS_INDEX}' already exists — skipping creation")
-except Exception:
-    print(f"Creating index '{EARNINGS_INDEX}' ...")
-    vsc.create_delta_sync_index(
-        endpoint_name=ENDPOINT_NAME,
-        index_name=EARNINGS_INDEX,
-        source_table_name=EARNINGS_SOURCE,
-        primary_key="chunk_id",
-        pipeline_type="TRIGGERED",
-        embedding_source_column="chunk_text",
-        embedding_model_endpoint_name=EMBEDDING_MODEL,
-        columns_to_sync=EARNINGS_SYNC_COLS,
-    )
-    print(f"Index '{EARNINGS_INDEX}': CREATE requested")
+_create_or_recreate_index(EARNINGS_INDEX, EARNINGS_SOURCE, EARNINGS_SYNC_COLS)
 
 # COMMAND ----------
 
@@ -205,22 +217,7 @@ NEWS_SYNC_COLS = [
     "token_count",
 ]
 
-try:
-    vsc.get_index(ENDPOINT_NAME, NEWS_INDEX).describe()
-    print(f"Index '{NEWS_INDEX}' already exists — skipping creation")
-except Exception:
-    print(f"Creating index '{NEWS_INDEX}' ...")
-    vsc.create_delta_sync_index(
-        endpoint_name=ENDPOINT_NAME,
-        index_name=NEWS_INDEX,
-        source_table_name=NEWS_SOURCE,
-        primary_key="chunk_id",
-        pipeline_type="TRIGGERED",
-        embedding_source_column="chunk_text",
-        embedding_model_endpoint_name=EMBEDDING_MODEL,
-        columns_to_sync=NEWS_SYNC_COLS,
-    )
-    print(f"Index '{NEWS_INDEX}': CREATE requested")
+_create_or_recreate_index(NEWS_INDEX, NEWS_SOURCE, NEWS_SYNC_COLS)
 
 # COMMAND ----------
 
