@@ -231,12 +231,16 @@ assert dscr_out["result"] is not None, f"FAIL: no DSCR data for {TEST_TICKER}"
 
 dscr = dscr_out["result"]
 assert dscr["ticker"] == TEST_TICKER
-assert dscr["dscr_raw"] is not None, "FAIL: dscr_raw is None"
 
 print(f"  Period:             {dscr['period_date']}")
 print(f"  Operating CF:       {dscr['operating_cash_flow']}")
 print(f"  Interest expense:   {dscr['interest_expense']}")
 print(f"  DSCR:               {dscr['dscr']}")
+
+if dscr["dscr_raw"] is None:
+    print("  (interest expense is N/A — no debt service obligation)")
+else:
+    assert dscr["dscr_raw"] > 0, "FAIL: dscr_raw should be positive"
 
 for step in dscr_out["calculation_steps"]:
     print(f"    {step}")
@@ -255,11 +259,10 @@ print("=" * 70)
 print("TEST: check_covenant_compliance")
 print("=" * 70)
 
-# Use generous thresholds that NVDA should comfortably pass
+# Test leverage covenants (always available from balance sheet)
 covenants = {
     "debt_to_equity": 5.0,
     "debt_to_assets": 0.9,
-    "min_dscr": 1.0,
 }
 
 cov_out = check_covenant_compliance(spark, TEST_TICKER, covenants)
@@ -276,12 +279,18 @@ for name, detail in cov["covenants"].items():
 for step in cov_out["calculation_steps"]:
     print(f"    {step}")
 
+# Test with min_dscr — may be UNKNOWN if interest_expense is N/A
+dscr_cov_out = check_covenant_compliance(spark, TEST_TICKER, {"min_dscr": 1.0})
+dscr_status = dscr_cov_out["result"]["covenants"]["min_dscr"]["status"]
+print(f"\n  min_dscr covenant: status={dscr_status}")
+assert dscr_status in ("COMPLIANT", "UNKNOWN"), f"FAIL: unexpected status {dscr_status}"
+
 # Now test with a tight threshold to force a breach
 tight_covenants = {"debt_to_equity": 0.001}
 tight_out = check_covenant_compliance(spark, TEST_TICKER, tight_covenants)
 tight_cov = tight_out["result"]["covenants"]["debt_to_equity"]
 assert tight_cov["status"] == "BREACH", f"FAIL: expected BREACH with threshold=0.001, got {tight_cov['status']}"
-print(f"\n  Tight threshold test: D/E threshold=0.001 → {tight_cov['status']} (expected)")
+print(f"  Tight threshold test: D/E threshold=0.001 → {tight_cov['status']} (expected)")
 
 print("\ncheck_covenant_compliance: PASSED\n")
 

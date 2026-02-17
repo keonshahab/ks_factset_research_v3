@@ -307,13 +307,15 @@ def calculate_debt_service_coverage(spark, ticker: str) -> Dict[str, Any]:
     """Compute the debt-service coverage ratio (DSCR).
 
     DSCR = operating_cash_flow / interest_expense   (using LTM if available).
+
+    If interest_expense is NULL or zero the company has no meaningful debt
+    service obligation — DSCR is reported as None with an explanatory note.
     """
-    # Prefer LTM, fall back to most recent annual
+    # Prefer LTM, fall back to most recent annual/quarterly
     sql = f"""
         SELECT *
         FROM {FINANCIALS_TABLE}
         WHERE ticker = '{ticker}'
-          AND interest_expense IS NOT NULL
           AND operating_cash_flow IS NOT NULL
         ORDER BY
             CASE period_type WHEN 'LTM' THEN 1 WHEN 'A' THEN 2 ELSE 3 END,
@@ -324,7 +326,7 @@ def calculate_debt_service_coverage(spark, ticker: str) -> Dict[str, Any]:
     if not rows:
         return {
             "result": None,
-            "calculation_steps": [f"No cash-flow / interest data found for {ticker}"],
+            "calculation_steps": [f"No operating cash-flow data found for {ticker}"],
             "sources": [FINANCIALS_TABLE],
         }
 
@@ -338,8 +340,14 @@ def calculate_debt_service_coverage(spark, ticker: str) -> Dict[str, Any]:
         f"Period: {row.get('period_date')} ({row.get('period_type')})",
         f"Operating cash flow: {_fmt(ocf)}",
         f"Interest expense:    {_fmt(int_exp)}",
-        f"DSCR = {_fmt(ocf)} / {_fmt(int_exp)} = {_fmt(dscr, is_ratio=True)}",
     ]
+
+    if int_exp is None or int_exp == 0:
+        steps.append("Interest expense is N/A or zero — no meaningful debt service obligation")
+        dscr_str = "N/A (no debt service)"
+    else:
+        steps.append(f"DSCR = {_fmt(ocf)} / {_fmt(int_exp)} = {_fmt(dscr, is_ratio=True)}")
+        dscr_str = _fmt(dscr, is_ratio=True)
 
     return {
         "result": {
@@ -347,7 +355,7 @@ def calculate_debt_service_coverage(spark, ticker: str) -> Dict[str, Any]:
             "period_date": str(row.get("period_date", "")),
             "operating_cash_flow": _fmt(ocf),
             "interest_expense": _fmt(int_exp),
-            "dscr": _fmt(dscr, is_ratio=True),
+            "dscr": dscr_str,
             "dscr_raw": dscr,
         },
         "calculation_steps": steps,
