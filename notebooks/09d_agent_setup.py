@@ -68,6 +68,7 @@ import importlib
 import mlflow
 import mlflow.pyfunc
 from mlflow.deployments import get_deploy_client
+from mlflow.types.llm import ChatCompletionResponse
 
 # Hot-reload source modules so edits take effect without cluster restart
 import src.citation_engine
@@ -917,16 +918,18 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
 
     @staticmethod
     def _build_response(content):
-        """Wrap text content in an OpenAI-compatible ChatResponse dict."""
-        return {
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
-                }
-            ]
-        }
+        """Wrap text content in a ChatCompletionResponse."""
+        return ChatCompletionResponse.from_dict(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
 
 
 print("FactSetResearchAgent class defined.")
@@ -1020,7 +1023,7 @@ for tq in TEST_QUERIES:
         response = agent.predict(
             context=None, messages=messages, params=params,
         )
-        content = response["choices"][0]["message"]["content"]
+        content = response.choices[0].message.content
 
         # Validate response
         assert content is not None, "FAIL: response content is None"
@@ -1078,7 +1081,7 @@ print(f"Logging model to: {REGISTERED_MODEL_NAME}")
 
 with mlflow.start_run(run_name="research_agent_v1") as run:
     model_info = mlflow.pyfunc.log_model(
-        artifact_path="agent",
+        name="agent",
         python_model=FactSetResearchAgent(),
         registered_model_name=REGISTERED_MODEL_NAME,
         input_example=input_example,
