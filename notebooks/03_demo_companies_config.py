@@ -173,6 +173,72 @@ if missing_tickers:
 else:
     found_fallback = 0
 
+# COMMAND ----------
+
+# Diagnostic: check if missing tickers exist in sym_ticker_region at all
+still_missing = [tr for tr in ticker_regions if tr not in entity_map]
+
+if still_missing:
+    still_missing_sql = ", ".join(f"'{t}'" for t in still_missing)
+
+    # Do the tickers exist in sym_ticker_region?
+    diag_tr = spark.sql(f"""
+        SELECT TICKER_REGION, FSYM_ID
+        FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region
+        WHERE TICKER_REGION IN ({still_missing_sql})
+    """)
+    diag_tr_rows = diag_tr.collect()
+    found_in_tr = {row["TICKER_REGION"] for row in diag_tr_rows}
+
+    print(f"Diagnostic — {len(still_missing)} tickers still missing entity_id/fsym_id:")
+    print(f"  Found in sym_ticker_region: {len(found_in_tr)} / {len(still_missing)}")
+    not_in_tr = [t for t in still_missing if t not in found_in_tr]
+    if not_in_tr:
+        print(f"  NOT in sym_ticker_region at all: {not_in_tr}")
+
+    # For those that ARE in sym_ticker_region, show why the join failed
+    if found_in_tr:
+        print(f"\n  FSYM_IDs found (join to ent_scr_sec_entity may be failing):")
+        for row in diag_tr_rows:
+            print(f"    {row['TICKER_REGION']:<12} FSYM_ID = {row['FSYM_ID']}")
+
+# COMMAND ----------
+
+# Fallback 2: crosswalk table (has factset_entity_id) + sym_ticker_region (for fsym_id)
+still_missing = [tr for tr in ticker_regions if tr not in entity_map]
+
+if still_missing:
+    still_missing_sql = ", ".join(f"'{t}'" for t in still_missing)
+    print(f"Fallback 2: crosswalk + sym_ticker_region for {len(still_missing)} tickers...")
+
+    # entity_id from crosswalk
+    xref_entity = spark.sql(f"""
+        SELECT ticker_region, factset_entity_id AS entity_id
+        FROM ks_position_sample.vendor_data.factset_symbology_xref
+        WHERE ticker_region IN ({still_missing_sql})
+    """)
+    xref_entity_map = {row["ticker_region"]: row["entity_id"] for row in xref_entity.collect()}
+
+    # fsym_id from sym_ticker_region directly (no join needed)
+    fsym_lookup = spark.sql(f"""
+        SELECT TICKER_REGION AS ticker_region, FSYM_ID AS fsym_id
+        FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region
+        WHERE TICKER_REGION IN ({still_missing_sql})
+    """)
+    fsym_map = {row["ticker_region"]: row["fsym_id"] for row in fsym_lookup.dropDuplicates(["ticker_region"]).collect()}
+
+    resolved_count = 0
+    for tr in still_missing:
+        eid = xref_entity_map.get(tr)
+        fid = fsym_map.get(tr)
+        if eid or fid:
+            from pyspark.sql import Row as _Row
+            entity_map[tr] = _Row(ticker_region=tr, entity_id=eid, fsym_id=fid)
+            resolved_count += 1
+            print(f"  {tr:<12} entity_id={'OK' if eid else 'MISS':<6}  fsym_id={'OK' if fid else 'MISS'}")
+
+    print(f"Fallback 2 resolved: {resolved_count} / {len(still_missing)}")
+
 print(f"\nTotal resolved: {len(entity_map)} / {len(ticker_regions)}")
 for tr in ticker_regions:
     if tr not in entity_map:
