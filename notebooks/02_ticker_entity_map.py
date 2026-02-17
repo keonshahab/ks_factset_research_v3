@@ -21,18 +21,18 @@
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE CATALOG IF NOT EXISTS ks_factset_research_v3;
+spark.sql("CREATE CATALOG IF NOT EXISTS ks_factset_research_v3")
+print("Catalog ks_factset_research_v3: OK")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE SCHEMA IF NOT EXISTS ks_factset_research_v3.gold;
+spark.sql("CREATE SCHEMA IF NOT EXISTS ks_factset_research_v3.gold")
+print("Schema ks_factset_research_v3.gold: OK")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE SCHEMA IF NOT EXISTS ks_factset_research_v3.demo;
+spark.sql("CREATE SCHEMA IF NOT EXISTS ks_factset_research_v3.demo")
+print("Schema ks_factset_research_v3.demo: OK")
 
 # COMMAND ----------
 
@@ -49,21 +49,23 @@
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE TABLE ks_factset_research_v3.gold.ticker_entity_map AS
-# MAGIC SELECT
-# MAGIC     tr.TICKER_REGION   AS ticker_region,
-# MAGIC     ese.FACTSET_ENTITY_ID AS entity_id,
-# MAGIC     se.ENTITY_PROPER_NAME AS company_name,
-# MAGIC     se.ISO_COUNTRY     AS country,
-# MAGIC     se.ENTITY_TYPE     AS entity_type,
-# MAGIC     tr.FSYM_ID         AS fsym_id
-# MAGIC FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region tr
-# MAGIC JOIN delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity ese
-# MAGIC     ON tr.FSYM_ID = ese.FSYM_ID
-# MAGIC JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
-# MAGIC     ON ese.FACTSET_ENTITY_ID = se.FACTSET_ENTITY_ID
-# MAGIC WHERE se.ENTITY_TYPE = 'PUB'
+spark.sql("""
+    CREATE OR REPLACE TABLE ks_factset_research_v3.gold.ticker_entity_map AS
+    SELECT
+        tr.TICKER_REGION       AS ticker_region,
+        ese.FACTSET_ENTITY_ID  AS entity_id,
+        se.ENTITY_PROPER_NAME  AS company_name,
+        se.ISO_COUNTRY         AS country,
+        se.ENTITY_TYPE         AS entity_type,
+        tr.FSYM_ID             AS fsym_id
+    FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region tr
+    JOIN delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity ese
+        ON tr.FSYM_ID = ese.FSYM_ID
+    JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
+        ON ese.FACTSET_ENTITY_ID = se.FACTSET_ENTITY_ID
+    WHERE se.ENTITY_TYPE = 'PUB'
+""")
+print("Table ks_factset_research_v3.gold.ticker_entity_map: CREATED")
 
 # COMMAND ----------
 
