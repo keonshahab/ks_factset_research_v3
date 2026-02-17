@@ -10,9 +10,8 @@
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
 # MAGIC | 1 | Create catalog and schemas |
-# MAGIC | 2 | Source table diagnostics (row counts, schemas, join-key overlap) |
-# MAGIC | 3 | Build `ticker_entity_map` from FactSet symbology + entity tables |
-# MAGIC | 4 | Validate coverage, uniqueness, and demo company presence |
+# MAGIC | 2 | Build `ticker_entity_map` from FactSet symbology + entity tables |
+# MAGIC | 3 | Validate coverage, uniqueness, and demo company presence |
 
 # COMMAND ----------
 
@@ -39,154 +38,15 @@ print("Schema ks_factset_research_v3.demo: OK")
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 2: Source Table Diagnostics
+# MAGIC ## Step 2: Create `ticker_entity_map`
 # MAGIC
-# MAGIC Before building the map, verify row counts, schemas, and join-key overlap
-# MAGIC for each source table.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.1 — Row Counts
-
-# COMMAND ----------
-
-tr_df  = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region")
-ese_df = spark.table("delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity")
-se_df  = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity")
-
-print(f"{'Source Table':<60} {'Rows':>12}")
-print("-" * 74)
-print(f"{'sym_ticker_region':<60} {tr_df.count():>12,}")
-print(f"{'ent_scr_sec_entity':<60} {ese_df.count():>12,}")
-print(f"{'sym_entity':<60} {se_df.count():>12,}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.2 — Schemas
-
-# COMMAND ----------
-
-for name, tdf in [("sym_ticker_region", tr_df), ("ent_scr_sec_entity", ese_df), ("sym_entity", se_df)]:
-    print(f"=== {name} ===")
-    for f in tdf.schema.fields:
-        print(f"  {f.name:<40} {str(f.dataType)}")
-    print()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.3 — Sample Rows from Each Source
-
-# COMMAND ----------
-
-print("=== sym_ticker_region (5 rows) ===")
-display(tr_df.limit(5))
-
-# COMMAND ----------
-
-print("=== ent_scr_sec_entity (5 rows) ===")
-display(ese_df.limit(5))
-
-# COMMAND ----------
-
-print("=== sym_entity (5 rows) ===")
-display(se_df.limit(5))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.4 — ENTITY_TYPE Distribution
+# MAGIC Join three FactSet Delta Share tables:
+# MAGIC - **sym_ticker_region** — maps `FSYM_ID` (regional, `-R` suffix) → ticker + region
+# MAGIC - **ent_scr_sec_entity** — maps `FSYM_ID` (security, `-S` suffix) → `FACTSET_ENTITY_ID`
+# MAGIC - **sym_entity** — maps `FACTSET_ENTITY_ID` → company name, country, entity type
 # MAGIC
-# MAGIC Check what values exist before filtering to `'PUB'`.
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-display(
-    se_df.groupBy("ENTITY_TYPE")
-    .count()
-    .orderBy(F.desc("count"))
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.5 — Join-Key Overlap Check
-
-# COMMAND ----------
-
-# Show sample FSYM_ID from each table to compare formats
-print("=== FSYM_ID samples ===\n")
-print("sym_ticker_region (first 5):")
-for row in tr_df.select("FSYM_ID").limit(5).collect():
-    print(f"  {row['FSYM_ID']}")
-
-print("\nent_scr_sec_entity (first 5):")
-for row in ese_df.select("FSYM_ID").limit(5).collect():
-    print(f"  {row['FSYM_ID']}")
-
-# Check base-ID overlap (strip suffix after last hyphen)
-tr_base  = tr_df.select(F.regexp_extract("FSYM_ID", r"^(.+)-", 1).alias("base_id")).distinct()
-ese_base = ese_df.select(F.regexp_extract("FSYM_ID", r"^(.+)-", 1).alias("base_id")).distinct()
-
-base_overlap = tr_base.join(ese_base, "base_id", "inner").count()
-print(f"\nBase-ID overlap (strip suffix): {base_overlap:,}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.6 — Available Tables in sym_v1 and ent_v1
-# MAGIC
-# MAGIC Find the bridge table that links regional (`-R`) to security (`-S`) FSYM_IDs.
-
-# COMMAND ----------
-
-print("=== Tables in sym_v1 ===")
-sym_tables = spark.sql("SHOW TABLES IN delta_share_factset_do_not_delete_or_edit.sym_v1").collect()
-for row in sym_tables:
-    print(f"  {row['tableName']}")
-
-print("\n=== Tables in ent_v1 ===")
-ent_tables = spark.sql("SHOW TABLES IN delta_share_factset_do_not_delete_or_edit.ent_v1").collect()
-for row in ent_tables:
-    print(f"  {row['tableName']}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.7 — sym_coverage Schema & Sample
-# MAGIC
-# MAGIC `sym_coverage` bridges regional (`-R`) and security (`-S`) FSYM_IDs.
-
-# COMMAND ----------
-
-cov_df = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_coverage")
-
-print("=== sym_coverage schema ===")
-for f in cov_df.schema.fields:
-    print(f"  {f.name:<40} {str(f.dataType)}")
-
-print(f"\nRow count: {cov_df.count():,}")
-
-# COMMAND ----------
-
-print("=== sym_coverage sample (5 rows) ===")
-display(cov_df.limit(5))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 3: Create `ticker_entity_map`
-# MAGIC
-# MAGIC **Problem:** `sym_ticker_region` uses regional FSYM_IDs (`-R`) while
-# MAGIC `ent_scr_sec_entity` uses security FSYM_IDs (`-S`). They share the same
-# MAGIC base ID but different suffixes, so a direct JOIN produces 0 rows.
-# MAGIC
-# MAGIC **Solution:** Join on the base FSYM_ID (strip the `-R` / `-S` suffix).
+# MAGIC The first two tables use different FSYM_ID levels (`-R` vs `-S`) that share the
+# MAGIC same base ID, so we join on `regexp_extract(FSYM_ID, '^(.+)-', 1)`.
 # MAGIC
 # MAGIC Filter to `ENTITY_TYPE = 'PUB'` (public companies only).
 
@@ -214,14 +74,16 @@ print("Table ks_factset_research_v3.gold.ticker_entity_map: CREATED")
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 4: Validation
+# MAGIC ## Step 3: Validation
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.1 — Row Count & Cardinality
+# MAGIC ### 3.1 — Row Count & Cardinality
 
 # COMMAND ----------
+
+from pyspark.sql import functions as F
 
 df = spark.table("ks_factset_research_v3.gold.ticker_entity_map")
 
@@ -240,7 +102,7 @@ print(f"{'Distinct countries':<30} {distinct_countries:>12,}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.2 — Sample Rows
+# MAGIC ### 3.2 — Sample Rows
 
 # COMMAND ----------
 
@@ -249,7 +111,7 @@ display(df.limit(10))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.3 — Top 10 Countries by Ticker Count
+# MAGIC ### 3.3 — Top 10 Countries by Ticker Count
 
 # COMMAND ----------
 
@@ -265,7 +127,7 @@ display(country_counts)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.4 — Verify Demo Companies
+# MAGIC ### 3.4 — Verify Demo Companies
 # MAGIC
 # MAGIC Confirm that the demo tickers from Notebook 01 are present in the mapping.
 
@@ -290,7 +152,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.5 — Check for Duplicate `ticker_region` Values
+# MAGIC ### 3.5 — Check for Duplicate `ticker_region` Values
 
 # COMMAND ----------
 
