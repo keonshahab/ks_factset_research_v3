@@ -392,6 +392,16 @@ spark.sql("""
 
 # Consensus: long format — use most recent consensus snapshot per item/period
 # (max CONS_START_DATE gives the latest consensus before the period ended)
+# Materialize the max start date first to avoid a self-join on the Delta Share table
+spark.sql("""
+    CREATE OR REPLACE TEMP VIEW v_cons_latest AS
+    SELECT FSYM_ID, FE_ITEM, FE_FP_END, MAX(CONS_START_DATE) AS max_start
+    FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf
+    GROUP BY FSYM_ID, FE_ITEM, FE_FP_END
+""")
+# Cache it so Spark doesn't fold it back into a self-join
+spark.table("v_cons_latest").cache().count()
+
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW v_consensus AS
     SELECT
@@ -405,11 +415,7 @@ spark.sql("""
     FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf con
     INNER JOIN target_companies tc
         ON con.FSYM_ID = tc.fsym_id
-    INNER JOIN (
-        SELECT FSYM_ID, FE_ITEM, FE_FP_END, MAX(CONS_START_DATE) AS max_start
-        FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf
-        GROUP BY FSYM_ID, FE_ITEM, FE_FP_END
-    ) latest
+    INNER JOIN v_cons_latest latest
         ON con.FSYM_ID = latest.FSYM_ID
         AND con.FE_ITEM = latest.FE_ITEM
         AND con.FE_FP_END = latest.FE_FP_END
