@@ -271,7 +271,7 @@ spark.sql("""
         ff.DATE                         AS period_date,
         'Q'                             AS period_type,
         ff.FF_FYR                       AS fiscal_year,
-        ff.FF_FQN                       AS fiscal_quarter,
+        ff.FF_FPNC                      AS fiscal_quarter,
         ff.FF_SALES                     AS revenue,
         ff.FF_EBITDA                    AS ebitda,
         ff.FF_NET_INC                   AS net_income,
