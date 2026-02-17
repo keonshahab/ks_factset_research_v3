@@ -10,8 +10,9 @@
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
 # MAGIC | 1 | Create catalog and schemas |
-# MAGIC | 2 | Build `ticker_entity_map` from FactSet symbology + entity tables |
-# MAGIC | 3 | Validate coverage, uniqueness, and demo company presence |
+# MAGIC | 2 | Source table diagnostics (row counts, schemas, join-key overlap) |
+# MAGIC | 3 | Build `ticker_entity_map` from FactSet symbology + entity tables |
+# MAGIC | 4 | Validate coverage, uniqueness, and demo company presence |
 
 # COMMAND ----------
 
@@ -38,7 +39,102 @@ print("Schema ks_factset_research_v3.demo: OK")
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 2: Create `ticker_entity_map`
+# MAGIC ## Step 2: Source Table Diagnostics
+# MAGIC
+# MAGIC Before building the map, verify row counts, schemas, and join-key overlap
+# MAGIC for each source table.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.1 — Row Counts
+
+# COMMAND ----------
+
+tr_df  = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region")
+ese_df = spark.table("delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity")
+se_df  = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity")
+
+print(f"{'Source Table':<60} {'Rows':>12}")
+print("-" * 74)
+print(f"{'sym_ticker_region':<60} {tr_df.count():>12,}")
+print(f"{'ent_scr_sec_entity':<60} {ese_df.count():>12,}")
+print(f"{'sym_entity':<60} {se_df.count():>12,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.2 — Schemas
+
+# COMMAND ----------
+
+for name, tdf in [("sym_ticker_region", tr_df), ("ent_scr_sec_entity", ese_df), ("sym_entity", se_df)]:
+    print(f"=== {name} ===")
+    for f in tdf.schema.fields:
+        print(f"  {f.name:<40} {str(f.dataType)}")
+    print()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.3 — Sample Rows from Each Source
+
+# COMMAND ----------
+
+print("=== sym_ticker_region (5 rows) ===")
+display(tr_df.limit(5))
+
+# COMMAND ----------
+
+print("=== ent_scr_sec_entity (5 rows) ===")
+display(ese_df.limit(5))
+
+# COMMAND ----------
+
+print("=== sym_entity (5 rows) ===")
+display(se_df.limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.4 — ENTITY_TYPE Distribution
+# MAGIC
+# MAGIC Check what values exist before filtering to `'PUB'`.
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+display(
+    se_df.groupBy("ENTITY_TYPE")
+    .count()
+    .orderBy(F.desc("count"))
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.5 — Join-Key Overlap Check
+
+# COMMAND ----------
+
+tr_fsym  = tr_df.select("FSYM_ID").distinct()
+ese_fsym = ese_df.select("FSYM_ID").distinct()
+
+overlap_1 = tr_fsym.join(ese_fsym, "FSYM_ID", "inner").count()
+print(f"FSYM_ID overlap  (sym_ticker_region ∩ ent_scr_sec_entity): {overlap_1:,}")
+
+ese_entity = ese_df.select("FACTSET_ENTITY_ID").distinct()
+se_entity  = se_df.select("FACTSET_ENTITY_ID").distinct()
+
+overlap_2 = ese_entity.join(se_entity, "FACTSET_ENTITY_ID", "inner").count()
+print(f"ENTITY_ID overlap (ent_scr_sec_entity ∩ sym_entity):       {overlap_2:,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Step 3: Create `ticker_entity_map`
 # MAGIC
 # MAGIC Join three FactSet Delta Share tables:
 # MAGIC - **sym_ticker_region** — maps `FSYM_ID` → ticker + region
@@ -71,12 +167,12 @@ print("Table ks_factset_research_v3.gold.ticker_entity_map: CREATED")
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 3: Validation
+# MAGIC ## Step 4: Validation
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.1 — Row Count & Cardinality
+# MAGIC ### 4.1 — Row Count & Cardinality
 
 # COMMAND ----------
 
@@ -97,7 +193,7 @@ print(f"{'Distinct countries':<30} {distinct_countries:>12,}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.2 — Sample Rows
+# MAGIC ### 4.2 — Sample Rows
 
 # COMMAND ----------
 
@@ -106,11 +202,9 @@ display(df.limit(10))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.3 — Top 10 Countries by Ticker Count
+# MAGIC ### 4.3 — Top 10 Countries by Ticker Count
 
 # COMMAND ----------
-
-from pyspark.sql import functions as F
 
 country_counts = (
     df.groupBy("country")
@@ -124,7 +218,7 @@ display(country_counts)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.4 — Verify Demo Companies
+# MAGIC ### 4.4 — Verify Demo Companies
 # MAGIC
 # MAGIC Confirm that the demo tickers from Notebook 01 are present in the mapping.
 
@@ -149,7 +243,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.5 — Check for Duplicate `ticker_region` Values
+# MAGIC ### 4.5 — Check for Duplicate `ticker_region` Values
 
 # COMMAND ----------
 
