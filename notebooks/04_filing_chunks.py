@@ -74,35 +74,38 @@ company_filter.createOrReplaceTempView("target_companies")
 # COMMAND ----------
 
 filing_chunks_sql = """
-    SELECT
-        edg.* EXCEPT(is_exhibit),
-        docs.content AS chunk_text,
-        tc.ticker,
-        tc.ticker_region,
-        CASE edg.fds_filing_type
-            WHEN '10-K'  THEN '10-K Annual Report'
-            WHEN '10KSB' THEN '10-K Annual Report'
-            WHEN '10-Q'  THEN '10-Q Quarterly Report'
-            WHEN '8-K'   THEN '8-K Current Report'
-            WHEN '20-F'  THEN '20-F Annual Report (Foreign)'
-            WHEN '6-K'   THEN '6-K Report (Foreign)'
-            ELSE edg.fds_filing_type
-        END AS doc_type_label,
-        CASE
-            WHEN edg.exhibit_level > 0 OR edg.exhibit_title IS NOT NULL THEN true
-            ELSE false
-        END AS is_exhibit,
-        YEAR(edg.acceptance_date) AS filing_year,
-        CONCAT('Q', QUARTER(edg.acceptance_date)) AS filing_quarter,
-        'edg_metadata' AS source_table
-    FROM factset_vectors_do_not_edit_or_delete.vector.edg_metadata edg
-    JOIN factset_vectors_do_not_edit_or_delete.vector.all_docs docs
-        ON edg.chunk_id = docs.chunk_id AND docs.product = 'EDG'
-    INNER JOIN target_companies tc
-        ON edg.company_name = tc.company_name_edg
-    WHERE docs.content IS NOT NULL
-      AND TRIM(docs.content) != ''
-      AND edg.token_count != 0
+    SELECT * FROM (
+        SELECT
+            edg.* EXCEPT(is_exhibit),
+            docs.content AS chunk_text,
+            tc.ticker,
+            tc.ticker_region,
+            CASE edg.fds_filing_type
+                WHEN '10-K'  THEN '10-K Annual Report'
+                WHEN '10KSB' THEN '10-K Annual Report'
+                WHEN '10-Q'  THEN '10-Q Quarterly Report'
+                WHEN '8-K'   THEN '8-K Current Report'
+                WHEN '20-F'  THEN '20-F Annual Report (Foreign)'
+                WHEN '6-K'   THEN '6-K Report (Foreign)'
+                ELSE edg.fds_filing_type
+            END AS doc_type_label,
+            CASE
+                WHEN edg.exhibit_level > 0 OR edg.exhibit_title IS NOT NULL THEN true
+                ELSE false
+            END AS is_exhibit,
+            YEAR(edg.acceptance_date) AS filing_year,
+            CONCAT('Q', QUARTER(edg.acceptance_date)) AS filing_quarter,
+            'edg_metadata' AS source_table,
+            ROW_NUMBER() OVER (PARTITION BY edg.chunk_id ORDER BY tc.ticker_region) AS _rn
+        FROM factset_vectors_do_not_edit_or_delete.vector.edg_metadata edg
+        JOIN factset_vectors_do_not_edit_or_delete.vector.all_docs docs
+            ON edg.chunk_id = docs.chunk_id AND docs.product = 'EDG'
+        INNER JOIN target_companies tc
+            ON edg.company_name = tc.company_name_edg
+        WHERE docs.content IS NOT NULL
+          AND TRIM(docs.content) != ''
+          AND edg.token_count != 0
+    ) WHERE _rn = 1
 """
 
 # COMMAND ----------
@@ -275,6 +278,14 @@ dup_chunks = spark.sql("""
     )
 """).collect()[0]["dup_count"]
 print(f"Duplicate chunk_ids: {dup_chunks}")
+if dup_chunks > 0:
+    print("Duplicate chunk_id details:")
+    display(spark.sql("""
+        SELECT chunk_id, COUNT(*) AS cnt, COLLECT_SET(ticker_region) AS ticker_regions
+        FROM ks_factset_research_v3.demo.filing_chunks
+        GROUP BY chunk_id
+        HAVING COUNT(*) > 1
+    """))
 assert dup_chunks == 0, f"FAIL: found {dup_chunks} duplicate chunk_ids"
 
 print("Data quality checks PASSED")
