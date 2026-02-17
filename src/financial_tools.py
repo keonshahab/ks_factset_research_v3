@@ -91,6 +91,10 @@ def _safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optio
 def get_company_profile(spark, ticker: str) -> Dict[str, Any]:
     """Return company profile metadata.
 
+    Uses ``display_name`` as the canonical company name (always correct from
+    the config table) rather than the entity-resolved ``company_name`` which
+    depends on the ``entity_id`` mapping being accurate.
+
     Returns dict with keys: result, calculation_steps, sources.
     """
     sql = f"""
@@ -102,10 +106,15 @@ def get_company_profile(spark, ticker: str) -> Dict[str, Any]:
     rows = _query_financials(spark, sql)
     profile = rows[0] if rows else {}
 
+    # Prefer display_name over entity-resolved company_name
+    if profile and profile.get("display_name"):
+        profile["company_name"] = profile["display_name"]
+
     return {
         "result": profile,
         "calculation_steps": [
             f"Queried {PROFILE_TABLE} for ticker={ticker}",
+            "Used display_name as canonical company_name",
         ],
         "sources": [PROFILE_TABLE],
     }
