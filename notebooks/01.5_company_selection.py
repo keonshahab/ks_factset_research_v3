@@ -1,7 +1,7 @@
 # Databricks notebook source
 
 # MAGIC %md
-# MAGIC # 02 — Company Selection: Top 20 Multi-Source Companies
+# MAGIC # 01.5 — Company Selection: Top 20 Multi-Source Companies
 # MAGIC
 # MAGIC **Goal:** Select 20 companies for the Research & Deal Intelligence agent.
 # MAGIC
@@ -11,18 +11,22 @@
 # MAGIC 3. Take the top 20 that appear in **at least 2 of 3** tables
 # MAGIC 4. If fewer than 20 qualify, backfill with top filing-only companies
 # MAGIC
+# MAGIC **Data notes:**
+# MAGIC - Tickers are stored in `primary_symbols` (ArrayType) — we extract element `[0]`
+# MAGIC - `company_name` exists in EDG and FCST but **not** in SA
+# MAGIC - SA company name is resolved via the EDG anchor (left join by ticker)
+# MAGIC
 # MAGIC **Output:** `ticker, company_name, filing_chunks, earnings_chunks, news_chunks`
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Phase 1: Discover Column Names (schema only — instant)
+# MAGIC ## Setup
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
 
 CATALOG_SCHEMA = "factset_vectors_do_not_edit_or_delete.vector"
 
@@ -32,86 +36,19 @@ sa_df = spark.table(f"{CATALOG_SCHEMA}.sa_metadata")
 
 # COMMAND ----------
 
-# Print schema for all three tables — no data scan, instant
-for label, df in [("edg_metadata", edg_df), ("fcst_metadata", fcst_df), ("sa_metadata", sa_df)]:
-    print(f"{'='*60}")
-    print(f"  {label}")
-    print(f"{'='*60}")
-    for field in df.schema.fields:
-        print(f"  {field.name:<40} {str(field.dataType)}")
-    print()
-
-# COMMAND ----------
-
-# Quick peek at 5 rows from each table — cheap limit() only
-print("=== edg_metadata — 5 sample rows ===")
-display(edg_df.limit(5))
-
-# COMMAND ----------
-
-print("=== fcst_metadata — 5 sample rows ===")
-display(fcst_df.limit(5))
-
-# COMMAND ----------
-
-print("=== sa_metadata — 5 sample rows ===")
-display(sa_df.limit(5))
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Phase 2: Configure Column Names
+# MAGIC ## Step 1: Top 30 companies from EDG by chunk count
 # MAGIC
-# MAGIC **Review the schemas and samples above**, then set the correct column names.
-# MAGIC
-# MAGIC **STOP:** Do NOT "Run All" past this cell until you have set the column names.
+# MAGIC Extract ticker from `primary_symbols[0]`, group with `company_name`.
 
 # COMMAND ----------
 
-# ── CONFIGURE THESE after reviewing Phase 1 output ──────────────────────────
-# Replace with the actual column names discovered above.
-# Look for:
-#   - Ticker: a string col with values like "AAPL", "MSFT-US", etc.
-#   - Company: a string col with values like "Apple Inc.", "Microsoft Corp", etc.
-#
-# If a table has no ticker column, you may need to join through a shared ID.
-
-TICKER_COL_EDG  = "CHANGE_ME"   # <-- set from Phase 1 output
-COMPANY_COL_EDG = "CHANGE_ME"   # <-- set from Phase 1 output
-
-TICKER_COL_FCST  = "CHANGE_ME"
-COMPANY_COL_FCST = "CHANGE_ME"
-
-TICKER_COL_SA  = "CHANGE_ME"
-COMPANY_COL_SA = "CHANGE_ME"
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Guard: stop execution if config is not set
-_all_configs = [TICKER_COL_EDG, COMPANY_COL_EDG, TICKER_COL_FCST, COMPANY_COL_FCST, TICKER_COL_SA, COMPANY_COL_SA]
-assert "CHANGE_ME" not in _all_configs, (
-    "⛔ STOP — You must set the column names above before running Phase 3. "
-    "Review the Phase 1 output and replace every CHANGE_ME."
-)
-
-print("Column configuration:")
-print(f"  EDG  → ticker: {TICKER_COL_EDG:<30} company: {COMPANY_COL_EDG}")
-print(f"  FCST → ticker: {TICKER_COL_FCST:<30} company: {COMPANY_COL_FCST}")
-print(f"  SA   → ticker: {TICKER_COL_SA:<30} company: {COMPANY_COL_SA}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Phase 3: Top 30 Filing Companies + Cross-Source Overlap
-
-# COMMAND ----------
-
-# Step 1: Top 30 companies from edg_metadata by chunk count
 edg_top30 = (
     edg_df
-    .groupBy(F.col(TICKER_COL_EDG).alias("ticker"), F.col(COMPANY_COL_EDG).alias("company_name"))
+    .withColumn("ticker", F.col("primary_symbols")[0])
+    .where(F.col("ticker").isNotNull())
+    .groupBy("ticker", "company_name")
     .agg(F.count("*").alias("filing_chunks"))
     .orderBy(F.desc("filing_chunks"))
     .limit(30)
@@ -122,22 +59,36 @@ display(edg_top30)
 
 # COMMAND ----------
 
-# Step 2: Chunk counts for the same tickers in FCST and SA
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Step 2: Chunk counts in FCST and SA for the same tickers
+
+# COMMAND ----------
+
 fcst_counts = (
     fcst_df
-    .groupBy(F.col(TICKER_COL_FCST).alias("ticker"))
+    .withColumn("ticker", F.col("primary_symbols")[0])
+    .where(F.col("ticker").isNotNull())
+    .groupBy("ticker")
     .agg(F.count("*").alias("earnings_chunks"))
 )
 
 sa_counts = (
     sa_df
-    .groupBy(F.col(TICKER_COL_SA).alias("ticker"))
+    .withColumn("ticker", F.col("primary_symbols")[0])
+    .where(F.col("ticker").isNotNull())
+    .groupBy("ticker")
     .agg(F.count("*").alias("news_chunks"))
 )
 
 # COMMAND ----------
 
-# Step 3: Left-join FCST and SA counts onto the top-30 filing companies
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Step 3: Left-join FCST and SA onto top-30 filing companies
+
+# COMMAND ----------
+
 combined = (
     edg_top30
     .join(fcst_counts, on="ticker", how="left")
@@ -145,9 +96,9 @@ combined = (
     .fillna(0, subset=["earnings_chunks", "news_chunks"])
     .withColumn(
         "source_count",
-        (F.when(F.col("filing_chunks") > 0, 1).otherwise(0))
-        + (F.when(F.col("earnings_chunks") > 0, 1).otherwise(0))
-        + (F.when(F.col("news_chunks") > 0, 1).otherwise(0))
+        F.lit(1)  # EDG always present
+        + F.when(F.col("earnings_chunks") > 0, 1).otherwise(0)
+        + F.when(F.col("news_chunks") > 0, 1).otherwise(0)
     )
 )
 
@@ -162,11 +113,10 @@ display(
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Phase 4: Final 20 — At Least 2/3 Sources, Backfill If Needed
+# MAGIC ## Step 4: Final 20 — at least 2/3 sources, backfill if needed
 
 # COMMAND ----------
 
-# Companies appearing in >= 2 sources, ordered by filing depth
 multi_source = (
     combined
     .where(F.col("source_count") >= 2)
@@ -176,7 +126,6 @@ multi_source = (
 multi_source_count = multi_source.count()
 print(f"Companies in >= 2 sources: {multi_source_count}")
 
-# Companies in only 1 source (filing-only), ordered by filing depth
 single_source = (
     combined
     .where(F.col("source_count") < 2)
@@ -185,7 +134,6 @@ single_source = (
 
 # COMMAND ----------
 
-# Build final list of exactly 20
 FINAL_N = 20
 
 if multi_source_count >= FINAL_N:
@@ -221,7 +169,6 @@ display(final_result)
 
 # COMMAND ----------
 
-# Also print as plain text for easy copy-paste
 rows = final_result.collect()
 
 print(f"\n{'Ticker':<20} {'Company':<35} {'Filings':>10} {'Earnings':>10} {'News':>10}")
