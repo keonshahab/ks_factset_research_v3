@@ -27,6 +27,11 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install databricks-vectorsearch -q
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
 dbutils.widgets.text("vs_endpoint", "one-env-shared-endpoint-11", "Vector Search endpoint name")
 
 # COMMAND ----------
