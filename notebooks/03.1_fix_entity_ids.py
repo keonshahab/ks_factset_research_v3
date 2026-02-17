@@ -76,8 +76,8 @@ if not mismatches:
 # MAGIC ---
 # MAGIC ## Step 2: Resolve Correct Entity IDs
 # MAGIC
-# MAGIC **Strategy 1** — Crosswalk table (curated, most reliable)
-# MAGIC **Strategy 2** — Name search in sym_entity (PUB entities only)
+# MAGIC **Strategy 1** — Name search in `sym_entity` (PUB + US) — most reliable for known US companies
+# MAGIC **Strategy 2** — Crosswalk table (fallback, strict name validation required)
 
 # COMMAND ----------
 
@@ -88,123 +88,133 @@ if mismatches:
     mismatch_ticker_regions = [row["ticker_region"] for row in mismatches]
     mismatch_tr_sql = ", ".join(f"'{tr}'" for tr in mismatch_ticker_regions)
 
-    # ── Strategy 1: Crosswalk table ──────────────────────────────────────
-    print("Strategy 1: Crosswalk table (ks_position_sample.vendor_data.factset_symbology_xref)")
+    # ── Full proper names for precise search ──────────────────────────
+    # Short display names like "AMD" or "Intel" are too ambiguous for
+    # a LIKE search against sym_entity (e.g. "Intel" matches
+    # "Intelligent", "AMD" matches "AMD Industries Ltd." in India).
+    # Use the legal-ish name so we can filter to PUB + US reliably.
+    PROPER_NAMES = {
+        "AAPL": "Apple Inc.",
+        "ABBV": "AbbVie Inc.",
+        "AMD":  "Advanced Micro Devices",
+        "AMZN": "Amazon.com",
+        "BAC":  "Bank of America",
+        "CAT":  "Caterpillar Inc.",
+        "COST": "Costco Wholesale",
+        "CRM":  "Salesforce",
+        "CVX":  "Chevron Corp",
+        "GOOGL": "Alphabet Inc.",
+        "INTC": "Intel Corp",
+        "JNJ":  "Johnson & Johnson",
+        "JPM":  "JPMorgan Chase",
+        "LLY":  "Eli Lilly",
+        "MA":   "Mastercard Inc",
+        "META": "Meta Platforms",
+        "MSFT": "Microsoft Corp",
+        "NVDA": "NVIDIA Corp",
+        "PG":   "Procter & Gamble",
+        "TSLA": "Tesla, Inc.",
+        "V":    "Visa Inc.",
+        "WMT":  "Walmart Inc.",
+        "XOM":  "Exxon Mobil",
+    }
+
+    # ── Strategy 1: Name search in sym_entity (PUB + US) ─────────────
+    # This is the most reliable strategy for well-known US companies.
+    # We search by proper name, filter to PUB entities in the US, and
+    # pick the shortest name match (= most specific / exact).
+    print("Strategy 1: Name search in sym_entity (PUB + US)")
     print("-" * 80)
 
-    try:
-        xref_df = spark.sql(f"""
+    for ticker in sorted(mismatch_tickers):
+        mm = mismatch_tickers[ticker]
+        display_name = mm["display_name"] or ""
+        search_name = PROPER_NAMES.get(ticker, display_name)
+        safe_name = search_name.replace("'", "''")
+
+        candidates = spark.sql(f"""
             SELECT
-                xr.ticker_region,
-                xr.factset_entity_id AS entity_id,
-                se.ENTITY_PROPER_NAME AS entity_name,
-                se.ENTITY_TYPE AS entity_type
-            FROM ks_position_sample.vendor_data.factset_symbology_xref xr
-            LEFT JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
-                ON xr.factset_entity_id = se.FACTSET_ENTITY_ID
-            WHERE xr.ticker_region IN ({mismatch_tr_sql})
-        """)
+                FACTSET_ENTITY_ID AS entity_id,
+                ENTITY_PROPER_NAME AS entity_name,
+                ISO_COUNTRY AS country
+            FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity
+            WHERE LOWER(ENTITY_PROPER_NAME) LIKE LOWER('%{safe_name}%')
+              AND ENTITY_TYPE = 'PUB'
+              AND ISO_COUNTRY = 'US'
+            ORDER BY LENGTH(ENTITY_PROPER_NAME)
+            LIMIT 5
+        """).collect()
 
-        xref_rows = xref_df.collect()
-        print(f"  Crosswalk returned {len(xref_rows)} row(s)")
+        if candidates:
+            best = candidates[0]  # shortest name = most specific match
+            fixes[ticker] = {
+                "entity_id": best["entity_id"],
+                "source": f"name search ('{search_name}')",
+            }
+            print(f"  {ticker:<8} -> {best['entity_id']:<15} {best['entity_name']}")
+            for c in candidates[1:]:
+                print(f"           (also: {c['entity_id']:<15} {c['entity_name']})")
+        else:
+            print(f"  {ticker:<8} -- no PUB+US match for '{search_name}'")
 
-        for xr in xref_rows:
-            tr = xr["ticker_region"]
-            ticker = tr.split("-")[0]
-            mm = mismatch_tickers.get(ticker)
-            if not mm:
-                continue
+    print(f"\n  Resolved via name search: {len(fixes)} / {len(mismatch_tickers)}")
 
-            display = (mm["display_name"] or "").lower()
-            ename = (xr["entity_name"] or "").lower()
-            name_ok = display in ename or ename in display
-
-            print(f"  {ticker:<8} → {xr['entity_id']:<15} {xr['entity_name'] or '(NULL)':<40} type={xr['entity_type'] or 'N/A':<5} name_match={name_ok}")
-
-            if name_ok and ticker not in fixes:
-                fixes[ticker] = {
-                    "entity_id": xr["entity_id"],
-                    "source": "crosswalk (name-matched)",
-                }
-            elif xr["entity_type"] == "PUB" and ticker not in fixes:
-                fixes[ticker] = {
-                    "entity_id": xr["entity_id"],
-                    "source": "crosswalk (PUB)",
-                }
-
-        print(f"  Resolved via crosswalk: {len(fixes)}")
-
-    except Exception as e:
-        print(f"  Crosswalk table not available: {e}")
-
-    # ── Strategy 2: Name search in sym_entity ────────────────────────────
+    # ── Strategy 2: Crosswalk fallback ───────────────────────────────
+    # Only used for tickers that Strategy 1 missed.  Strict validation:
+    # the crosswalk entity must resolve to a non-NULL PUB entity whose
+    # name matches the display_name.
     still_missing = [t for t in mismatch_tickers if t not in fixes]
 
     if still_missing:
-        print(f"\nStrategy 2: Name search in sym_entity for {len(still_missing)} remaining tickers")
+        print(f"\nStrategy 2: Crosswalk table for {len(still_missing)} remaining tickers")
         print("-" * 80)
 
-        for ticker in still_missing:
-            mm = mismatch_tickers[ticker]
-            display_name = mm["display_name"] or ""
+        still_missing_trs = [mismatch_tickers[t]["ticker_region"] for t in still_missing]
+        still_missing_sql = ", ".join(f"'{tr}'" for tr in still_missing_trs)
 
-            # Build search terms — try the full display_name first
-            search_terms = [display_name]
-            # Also try individual words > 3 chars (for multi-word names)
-            words = [w for w in display_name.split() if len(w) > 3 and w not in ("Inc.", "Corp", "Corp.", "Ltd.", "Ltd", "Inc", "Co.", "Co", "Plc")]
-            if words and words[0] != display_name:
-                search_terms.append(words[0])
+        try:
+            xref_df = spark.sql(f"""
+                SELECT
+                    xr.ticker_region,
+                    xr.factset_entity_id AS entity_id,
+                    se.ENTITY_PROPER_NAME AS entity_name,
+                    se.ENTITY_TYPE AS entity_type,
+                    se.ISO_COUNTRY AS country
+                FROM ks_position_sample.vendor_data.factset_symbology_xref xr
+                LEFT JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
+                    ON xr.factset_entity_id = se.FACTSET_ENTITY_ID
+                WHERE xr.ticker_region IN ({still_missing_sql})
+            """)
 
-            found = False
-            for term in search_terms:
-                safe_term = term.replace("'", "''")
-                candidates = spark.sql(f"""
-                    SELECT
-                        FACTSET_ENTITY_ID AS entity_id,
-                        ENTITY_PROPER_NAME AS entity_name,
-                        ENTITY_TYPE AS entity_type,
-                        ISO_COUNTRY AS country
-                    FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity
-                    WHERE ENTITY_PROPER_NAME LIKE '%{safe_term}%'
-                      AND ENTITY_TYPE = 'PUB'
-                    ORDER BY ENTITY_PROPER_NAME
-                    LIMIT 20
-                """).collect()
+            for xr in xref_df.collect():
+                tr = xr["ticker_region"]
+                ticker = tr.split("-")[0]
+                mm = mismatch_tickers.get(ticker)
+                if not mm or ticker in fixes:
+                    continue
 
-                if candidates:
-                    print(f"\n  {ticker} — searching '{term}': {len(candidates)} PUB candidate(s)")
-                    best = None
-                    for c in candidates:
-                        ename = (c["entity_name"] or "").lower()
-                        # Prefer US entities and exact-ish name matches
-                        is_us = c["country"] == "US"
-                        name_close = display_name.lower() in ename
-                        marker = ""
-                        if name_close and is_us:
-                            marker = " <<<< BEST"
-                            if best is None:
-                                best = c
-                        elif name_close:
-                            marker = " (name match)"
-                            if best is None:
-                                best = c
-                        elif is_us:
-                            marker = " (US)"
-                        print(f"    {c['entity_id']:<15} {c['entity_name']:<45} {c['country'] or '??':<4} {marker}")
+                ename = (xr["entity_name"] or "").strip()
+                display = (mm["display_name"] or "").lower()
 
-                    if best:
-                        fixes[ticker] = {
-                            "entity_id": best["entity_id"],
-                            "source": f"name search ('{term}')",
-                        }
-                        print(f"    → SELECTED: {best['entity_id']} ({best['entity_name']})")
-                        found = True
-                        break
+                # Strict: name must be non-empty, PUB type, and match
+                if not ename:
+                    print(f"  {ticker:<8} -> {xr['entity_id']:<15} SKIP (no name in sym_entity)")
+                    continue
 
-            if not found:
-                print(f"\n  {ticker} — no suitable PUB entity found for '{display_name}'")
+                name_ok = display in ename.lower() or ename.lower() in display
+                if xr["entity_type"] == "PUB" and name_ok:
+                    fixes[ticker] = {
+                        "entity_id": xr["entity_id"],
+                        "source": f"crosswalk (verified: {ename})",
+                    }
+                    print(f"  {ticker:<8} -> {xr['entity_id']:<15} {ename:<40} OK")
+                else:
+                    print(f"  {ticker:<8} -> {xr['entity_id']:<15} {ename:<40} SKIP (type={xr['entity_type']}, match={name_ok})")
 
-    # ── Also fix fsym_id from sym_ticker_region ──────────────────────────
+        except Exception as e:
+            print(f"  Crosswalk table not available: {e}")
+
+    # ── Also fix fsym_id from sym_ticker_region ──────────────────────
     print(f"\nLooking up correct fsym_id values from sym_ticker_region...")
 
     fsym_df = spark.sql(f"""
@@ -222,13 +232,13 @@ if mismatches:
         tr = mm["ticker_region"]
         fixes[ticker]["fsym_id"] = fsym_map.get(tr)
 
-    # ── Summary ──────────────────────────────────────────────────────────
+    # ── Summary ──────────────────────────────────────────────────────
     print(f"\n{'='*80}")
     print(f"SUMMARY: {len(fixes)} fix(es) ready out of {len(mismatches)} mismatches")
     print(f"{'='*80}")
     for ticker, fix in sorted(fixes.items()):
         mm = mismatch_tickers[ticker]
-        print(f"  {ticker:<8} {mm['current_entity_id']:<15} → {fix['entity_id']:<15}  fsym_id={fix.get('fsym_id', 'N/A')}  via {fix['source']}")
+        print(f"  {ticker:<8} {mm['current_entity_id']:<15} -> {fix['entity_id']:<15}  fsym_id={fix.get('fsym_id', 'N/A')}  via {fix['source']}")
 
     unfixed = [t for t in mismatch_tickers if t not in fixes]
     if unfixed:
