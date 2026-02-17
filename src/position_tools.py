@@ -205,7 +205,7 @@ def get_firm_exposure(
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
         GROUP BY desk
-        ORDER BY SUM(notional) DESC
+        ORDER BY 2 DESC
     """)
 
     # Breakdown by asset_class
@@ -217,7 +217,7 @@ def get_firm_exposure(
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
         GROUP BY asset_class
-        ORDER BY SUM(notional) DESC
+        ORDER BY 2 DESC
     """)
 
     # Breakdown by book_type
@@ -229,7 +229,7 @@ def get_firm_exposure(
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
         GROUP BY book_type
-        ORDER BY SUM(notional) DESC
+        ORDER BY 2 DESC
     """)
 
     steps.append(
@@ -351,7 +351,7 @@ def get_desk_pnl(
               WHERE ticker_region = '{ticker_region}'
           )
         GROUP BY desk
-        ORDER BY SUM(daily_pnl) DESC
+        ORDER BY 2 DESC
     """)
 
     for d in desk_summary:
