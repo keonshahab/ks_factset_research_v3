@@ -35,41 +35,44 @@ sa_df = spark.table(f"{CATALOG_SCHEMA}.sa_metadata")
 
 # COMMAND ----------
 
-def discover_id_columns(df, table_name):
-    """Find columns likely to be ticker or company name identifiers."""
-    keywords = ["ticker", "company", "entity", "issuer", "name", "symbol", "cusip", "isin", "sedol"]
-    string_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]
+def discover_all_columns(df, table_name):
+    """Print every column with type, distinct count, and samples for string cols."""
+    print(f"{'='*100}")
+    print(f"  ALL COLUMNS IN {table_name}  ({df.count():,} rows)")
+    print(f"{'='*100}")
+    print(f"  {'Column':<40} {'Type':<15} {'Distinct':>10}   {'Sample Values'}")
+    print(f"  {'-'*95}")
 
-    candidates = [c for c in string_cols if any(kw in c.lower() for kw in keywords)]
+    for field in df.schema.fields:
+        col_name = field.name
+        col_type = str(field.dataType).replace("Type", "")
+        is_string = isinstance(field.dataType, StringType)
 
-    if not candidates:
-        print(f"  No obvious ID columns found in {table_name}. All string columns:")
-        for c in string_cols:
-            print(f"    {c}")
-        return
-
-    # Profile each candidate: distinct count + sample values
-    print(f"=== {table_name}: Candidate ID columns ===\n")
-    print(f"  {'Column':<40} {'Distinct':>10}   {'Sample Values'}")
-    print(f"  {'-'*90}")
-
-    for col_name in candidates:
-        n_distinct = df.select(F.countDistinct(col_name)).collect()[0][0]
-        samples = (
-            df.select(col_name)
-            .where(F.col(col_name).isNotNull())
-            .distinct()
-            .limit(5)
-            .collect()
-        )
-        sample_vals = [row[0] for row in samples]
-        print(f"  {col_name:<40} {n_distinct:>10,}   {sample_vals}")
+        if is_string:
+            n_distinct = df.select(F.countDistinct(col_name)).collect()[0][0]
+            samples = (
+                df.select(col_name)
+                .where(F.col(col_name).isNotNull())
+                .distinct()
+                .limit(5)
+                .collect()
+            )
+            sample_vals = [row[0][:40] if row[0] and len(row[0]) > 40 else row[0] for row in samples]
+            print(f"  {col_name:<40} {col_type:<15} {n_distinct:>10,}   {sample_vals}")
+        else:
+            print(f"  {col_name:<40} {col_type:<15}")
 
     print()
 
-discover_id_columns(edg_df, "edg_metadata")
-discover_id_columns(fcst_df, "fcst_metadata")
-discover_id_columns(sa_df, "sa_metadata")
+discover_all_columns(edg_df, "edg_metadata")
+
+# COMMAND ----------
+
+discover_all_columns(fcst_df, "fcst_metadata")
+
+# COMMAND ----------
+
+discover_all_columns(sa_df, "sa_metadata")
 
 # COMMAND ----------
 
@@ -84,15 +87,22 @@ discover_id_columns(sa_df, "sa_metadata")
 
 # ── CONFIGURE THESE after reviewing Phase 1 output ──────────────────────────
 # Replace with the actual column names discovered above.
+# Look for:
+#   - Ticker: a string col with ~hundreds to low-thousands of distinct values,
+#             samples look like stock tickers (e.g. "AAPL", "MSFT-US", "000001-CN")
+#   - Company: a string col with similar cardinality, samples are company names
+#
+# If one table lacks a ticker column, you may need to join through a shared ID
+# (e.g. factset_entity_id, document_id) or use chunk_id → all_docs → product.
 
-TICKER_COL_EDG  = "ticker_region"    # e.g. "AAPL-US"
-COMPANY_COL_EDG = "entity_name"      # e.g. "Apple Inc."
+TICKER_COL_EDG  = "CHANGE_ME"   # <-- set from Phase 1 output
+COMPANY_COL_EDG = "CHANGE_ME"   # <-- set from Phase 1 output
 
-TICKER_COL_FCST  = "ticker_region"
-COMPANY_COL_FCST = "entity_name"
+TICKER_COL_FCST  = "CHANGE_ME"
+COMPANY_COL_FCST = "CHANGE_ME"
 
-TICKER_COL_SA  = "ticker_region"
-COMPANY_COL_SA = "entity_name"
+TICKER_COL_SA  = "CHANGE_ME"
+COMPANY_COL_SA = "CHANGE_ME"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
