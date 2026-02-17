@@ -1,22 +1,17 @@
 # Databricks notebook source
 
 # MAGIC %md
-# MAGIC # 01.5 — Company Selection: Top 20 Multi-Source Companies
+# MAGIC # 01.5 — Company Selection: Crosswalk + Capital Markets
 # MAGIC
 # MAGIC **Goal:** Select 20 companies for the Research & Deal Intelligence agent.
 # MAGIC
 # MAGIC **Logic:**
-# MAGIC 1. Rank top 30 companies from `edg_metadata` by chunk count (filings anchor)
-# MAGIC 2. Check whether each also appears in `fcst_metadata` (earnings) and `sa_metadata` (news)
-# MAGIC 3. Take the top 20 that appear in **at least 2 of 3** tables
-# MAGIC 4. If fewer than 20 qualify, backfill with top filing-only companies
+# MAGIC 1. Pull the 43 tickers from `ks_position_sample.vendor_data.factset_symbology_xref` (the crosswalk)
+# MAGIC 2. For each, count chunks in `edg_metadata` / `fcst_metadata` / `sa_metadata` / `all_docs`
+# MAGIC 3. Search additional capital-markets names **not** in the crosswalk but present in `edg_metadata`
+# MAGIC 4. Pick top 20: prioritise crosswalk companies with strong coverage, fill with capital-markets names
 # MAGIC
-# MAGIC **Data notes:**
-# MAGIC - Tickers are stored in `primary_symbols` (ArrayType) — we extract element `[0]`
-# MAGIC - `company_name` exists in EDG and FCST but **not** in SA
-# MAGIC - SA company name is resolved via the EDG anchor (left join by ticker)
-# MAGIC
-# MAGIC **Output:** `ticker, company_name, filing_chunks, earnings_chunks, news_chunks`
+# MAGIC **Output:** `ticker_region, company_name, filing_chunks, earnings_chunks, news_chunks, total_chunks, source`
 
 # COMMAND ----------
 
@@ -27,127 +22,426 @@
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
 
-CATALOG_SCHEMA = "factset_vectors_do_not_edit_or_delete.vector"
+VECTOR_SCHEMA  = "factset_vectors_do_not_edit_or_delete.vector"
+XREF_TABLE     = "ks_position_sample.vendor_data.factset_symbology_xref"
 
-edg_df = spark.table(f"{CATALOG_SCHEMA}.edg_metadata")
-fcst_df = spark.table(f"{CATALOG_SCHEMA}.fcst_metadata")
-sa_df = spark.table(f"{CATALOG_SCHEMA}.sa_metadata")
+edg_df      = spark.table(f"{VECTOR_SCHEMA}.edg_metadata")
+fcst_df     = spark.table(f"{VECTOR_SCHEMA}.fcst_metadata")
+sa_df       = spark.table(f"{VECTOR_SCHEMA}.sa_metadata")
+all_docs_df = spark.table(f"{VECTOR_SCHEMA}.all_docs")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 1: Top 30 companies from EDG by chunk count
-# MAGIC
-# MAGIC Extract ticker from `primary_symbols[0]`, group with `company_name`.
+# MAGIC ## Step 1 — Crosswalk: 43 Tickers from the Position Book
 
 # COMMAND ----------
 
-edg_top30 = (
-    edg_df
-    .withColumn("ticker", F.get("primary_symbols", 0))
-    .where(F.col("ticker").isNotNull())
-    .groupBy("ticker", "company_name")
-    .agg(F.count("*").alias("filing_chunks"))
-    .orderBy(F.desc("filing_chunks"))
-    .limit(30)
+xref_df = spark.sql("""
+    SELECT ticker_region, factset_entity_id, isin, company_name
+    FROM ks_position_sample.vendor_data.factset_symbology_xref
+""")
+
+xref_count = xref_df.count()
+print(f"Crosswalk tickers: {xref_count}")
+display(xref_df.orderBy("ticker_region"))
+
+# COMMAND ----------
+
+# Collect crosswalk tickers and company names for downstream matching
+xref_rows = xref_df.collect()
+xref_tickers = [row["ticker_region"] for row in xref_rows]
+xref_names   = {row["ticker_region"]: row["company_name"] for row in xref_rows}
+
+print(f"Tickers: {sorted(xref_tickers)}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Step 2 — Document Coverage for Crosswalk Tickers
+# MAGIC
+# MAGIC For each of the 43 tickers, count how many chunks exist in each source.
+# MAGIC
+# MAGIC | Source | Match strategy |
+# MAGIC |---|---|
+# MAGIC | `edg_metadata`  | `company_name` — exact first, then fuzzy (`contains`) |
+# MAGIC | `fcst_metadata` | `primary_symbols` array contains the ticker |
+# MAGIC | `sa_metadata`   | `primary_symbols` array contains the ticker |
+# MAGIC | `all_docs`      | aggregate by product type via join |
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2a — EDG: Filings — match on company_name (exact then fuzzy)
+
+# COMMAND ----------
+
+# Build a mapping from crosswalk company_name → ticker_region
+# so we can join back after grouping edg by company_name
+from pyspark.sql import Row
+
+xref_spark = spark.createDataFrame(
+    [Row(ticker_region=t, xref_company=n) for t, n in xref_names.items()]
 )
 
-print("=== Top 30 companies by EDG chunk count ===")
-display(edg_top30)
+# --- Exact match ---
+edg_by_company = (
+    edg_df
+    .groupBy("company_name")
+    .agg(F.count("*").alias("filing_chunks"))
+)
+
+edg_exact = (
+    xref_spark
+    .join(edg_by_company, F.upper(F.col("xref_company")) == F.upper(F.col("company_name")), "left")
+    .select("ticker_region", "xref_company", "company_name", "filing_chunks")
+)
+
+exact_hits   = edg_exact.where(F.col("filing_chunks").isNotNull()).count()
+exact_misses = edg_exact.where(F.col("filing_chunks").isNull()).count()
+print(f"EDG exact-match: {exact_hits} hit, {exact_misses} miss")
+
+# Show misses for diagnosis
+if exact_misses > 0:
+    print("\n--- Missed on exact match (will try fuzzy) ---")
+    display(edg_exact.where(F.col("filing_chunks").isNull()).select("ticker_region", "xref_company"))
+
+# COMMAND ----------
+
+# --- Fuzzy / partial match for the misses ---
+missed_tickers = [
+    row["ticker_region"]
+    for row in edg_exact.where(F.col("filing_chunks").isNull()).collect()
+]
+
+fuzzy_results = []
+if missed_tickers:
+    # Get distinct company names in EDG for matching
+    edg_companies = edg_by_company.collect()
+
+    for ticker in missed_tickers:
+        xref_name = xref_names[ticker].upper()
+        best_match = None
+        best_chunks = 0
+        # Try: crosswalk name contained in edg name, or edg name contained in crosswalk name
+        for row in edg_companies:
+            edg_name = (row["company_name"] or "").upper()
+            if not edg_name:
+                continue
+            # Check if one contains a significant portion of the other
+            xref_words = set(xref_name.split())
+            edg_words = set(edg_name.split())
+            # If the main company word (longest word > 3 chars) matches
+            xref_main = [w for w in xref_words if len(w) > 3]
+            edg_main  = [w for w in edg_words if len(w) > 3]
+            overlap = set(xref_main) & set(edg_main)
+            if overlap and row["filing_chunks"] > best_chunks:
+                best_match = row["company_name"]
+                best_chunks = row["filing_chunks"]
+        if best_match:
+            fuzzy_results.append(Row(
+                ticker_region=ticker,
+                xref_company=xref_names[ticker],
+                company_name=best_match,
+                filing_chunks=best_chunks,
+            ))
+            print(f"  FUZZY: {ticker} '{xref_names[ticker]}' → '{best_match}' ({best_chunks:,} chunks)")
+        else:
+            fuzzy_results.append(Row(
+                ticker_region=ticker,
+                xref_company=xref_names[ticker],
+                company_name=None,
+                filing_chunks=0,
+            ))
+            print(f"  MISS:  {ticker} '{xref_names[ticker]}' — no fuzzy match found")
+
+print(f"\nFuzzy matches found: {sum(1 for r in fuzzy_results if r.filing_chunks > 0)}")
+
+# COMMAND ----------
+
+# Merge exact + fuzzy into one EDG result per crosswalk ticker
+edg_exact_hits = edg_exact.where(F.col("filing_chunks").isNotNull())
+
+if fuzzy_results:
+    fuzzy_df = spark.createDataFrame(fuzzy_results)
+    edg_all = edg_exact_hits.unionByName(fuzzy_df)
+else:
+    edg_all = edg_exact_hits
+
+# Also include tickers with zero filing coverage
+edg_all = (
+    xref_spark
+    .join(
+        edg_all.select("ticker_region", "filing_chunks"),
+        on="ticker_region",
+        how="left",
+    )
+    .fillna(0, subset=["filing_chunks"])
+)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 2: Chunk counts in FCST and SA for the same tickers
+# MAGIC ### 2b — FCST: Earnings Transcripts — match on primary_symbols
 
 # COMMAND ----------
+
+# Extract ticker from primary_symbols[0], filter to crosswalk tickers
+xref_ticker_list = xref_tickers  # python list for isin()
 
 fcst_counts = (
     fcst_df
     .withColumn("ticker", F.get("primary_symbols", 0))
     .where(F.col("ticker").isNotNull())
+    .where(F.col("ticker").isin(xref_ticker_list))
     .groupBy("ticker")
     .agg(F.count("*").alias("earnings_chunks"))
+    .withColumnRenamed("ticker", "ticker_region")
 )
+
+print(f"FCST tickers matched: {fcst_counts.count()}")
+display(fcst_counts.orderBy(F.desc("earnings_chunks")))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2c — SA: News / StreetAccount — match on primary_symbols containing ticker
+
+# COMMAND ----------
+
+# SA primary_symbols is an array — check if any element matches a crosswalk ticker
+# Use array_contains for each ticker, or explode + filter
 
 sa_counts = (
     sa_df
     .withColumn("ticker", F.get("primary_symbols", 0))
     .where(F.col("ticker").isNotNull())
+    .where(F.col("ticker").isin(xref_ticker_list))
     .groupBy("ticker")
     .agg(F.count("*").alias("news_chunks"))
+    .withColumnRenamed("ticker", "ticker_region")
 )
+
+print(f"SA tickers matched: {sa_counts.count()}")
+display(sa_counts.orderBy(F.desc("news_chunks")))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 3: Left-join FCST and SA onto top-30 filing companies
+# MAGIC ### 2d — Combine: Full coverage view for crosswalk tickers
 
 # COMMAND ----------
 
-combined = (
-    edg_top30
-    .join(fcst_counts, on="ticker", how="left")
-    .join(sa_counts, on="ticker", how="left")
-    .fillna(0, subset=["earnings_chunks", "news_chunks"])
+crosswalk_coverage = (
+    xref_spark.withColumnRenamed("xref_company", "company_name")
+    .join(
+        edg_all.select("ticker_region", "filing_chunks"),
+        on="ticker_region",
+        how="left",
+    )
+    .join(fcst_counts, on="ticker_region", how="left")
+    .join(sa_counts,   on="ticker_region", how="left")
+    .fillna(0, subset=["filing_chunks", "earnings_chunks", "news_chunks"])
     .withColumn(
-        "source_count",
-        F.lit(1)  # EDG always present
-        + F.when(F.col("earnings_chunks") > 0, 1).otherwise(0)
-        + F.when(F.col("news_chunks") > 0, 1).otherwise(0)
+        "total_chunks",
+        F.col("filing_chunks") + F.col("earnings_chunks") + F.col("news_chunks"),
+    )
+    .orderBy(F.desc("total_chunks"))
+)
+
+print("=" * 110)
+print("STEP 2 RESULT: Crosswalk tickers — document coverage")
+print("=" * 110)
+display(
+    crosswalk_coverage.select(
+        "ticker_region", "company_name",
+        "filing_chunks", "earnings_chunks", "news_chunks", "total_chunks",
     )
 )
 
-print("=== Top 30 filings companies with cross-source overlap ===")
-display(
-    combined
-    .select("ticker", "company_name", "filing_chunks", "earnings_chunks", "news_chunks", "source_count")
-    .orderBy(F.desc("source_count"), F.desc("filing_chunks"))
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Step 3 — Additional Capital-Markets Names (Not in Crosswalk)
+# MAGIC
+# MAGIC Search `edg_metadata` for these names to fill out to 20 companies.
+
+# COMMAND ----------
+
+CAPITAL_MARKETS_NAMES = [
+    "Citigroup", "Wells Fargo", "BlackRock", "State Street", "Charles Schwab",
+    "Capital One", "S&P Global", "MSCI", "Moody's", "FactSet",
+    "ICE", "CME Group", "Nasdaq", "KKR", "Apollo",
+    "Blackstone", "Carlyle", "Ares", "Brookfield", "Lazard",
+    "Evercore", "PJT Partners", "Jefferies", "Raymond James", "BNY Mellon",
+    "Northern Trust", "PNC", "US Bancorp", "Truist",
+]
+
+# Remove any that are already in the crosswalk (case-insensitive check on company_name)
+xref_names_upper = {v.upper() for v in xref_names.values()}
+cm_names_to_search = [
+    n for n in CAPITAL_MARKETS_NAMES
+    if n.upper() not in xref_names_upper
+]
+print(f"Capital-markets names to search (after excluding crosswalk): {len(cm_names_to_search)}")
+print(cm_names_to_search)
+
+# COMMAND ----------
+
+# Search edg_metadata for each name (case-insensitive contains)
+# and get their ticker from primary_symbols[0]
+
+edg_with_ticker = (
+    edg_df
+    .withColumn("ticker", F.get("primary_symbols", 0))
+    .where(F.col("ticker").isNotNull())
 )
+
+cm_results = []
+
+for search_name in cm_names_to_search:
+    matches = (
+        edg_with_ticker
+        .where(F.upper(F.col("company_name")).contains(search_name.upper()))
+        .groupBy("ticker", "company_name")
+        .agg(F.count("*").alias("filing_chunks"))
+        .orderBy(F.desc("filing_chunks"))
+        .limit(1)  # take the top match
+        .collect()
+    )
+    if matches:
+        row = matches[0]
+        cm_results.append(Row(
+            ticker_region=row["ticker"],
+            company_name=row["company_name"],
+            filing_chunks=row["filing_chunks"],
+            search_term=search_name,
+        ))
+        print(f"  FOUND: '{search_name}' → {row['ticker']} / '{row['company_name']}' ({row['filing_chunks']:,} chunks)")
+    else:
+        print(f"  MISS:  '{search_name}' — not found in edg_metadata")
+
+print(f"\nCapital-markets names found in EDG: {len(cm_results)}")
+
+# COMMAND ----------
+
+# For the found CM companies, also count FCST + SA chunks
+
+if cm_results:
+    cm_df = spark.createDataFrame(cm_results)
+    cm_ticker_list = [r.ticker_region for r in cm_results]
+
+    cm_fcst = (
+        fcst_df
+        .withColumn("ticker", F.get("primary_symbols", 0))
+        .where(F.col("ticker").isNotNull())
+        .where(F.col("ticker").isin(cm_ticker_list))
+        .groupBy("ticker")
+        .agg(F.count("*").alias("earnings_chunks"))
+        .withColumnRenamed("ticker", "ticker_region")
+    )
+
+    cm_sa = (
+        sa_df
+        .withColumn("ticker", F.get("primary_symbols", 0))
+        .where(F.col("ticker").isNotNull())
+        .where(F.col("ticker").isin(cm_ticker_list))
+        .groupBy("ticker")
+        .agg(F.count("*").alias("news_chunks"))
+        .withColumnRenamed("ticker", "ticker_region")
+    )
+
+    cm_coverage = (
+        cm_df.select("ticker_region", "company_name", "filing_chunks")
+        .join(cm_fcst, on="ticker_region", how="left")
+        .join(cm_sa,   on="ticker_region", how="left")
+        .fillna(0, subset=["earnings_chunks", "news_chunks"])
+        .withColumn(
+            "total_chunks",
+            F.col("filing_chunks") + F.col("earnings_chunks") + F.col("news_chunks"),
+        )
+        .orderBy(F.desc("total_chunks"))
+    )
+
+    print("=" * 110)
+    print("STEP 3 RESULT: Capital-markets names — document coverage")
+    print("=" * 110)
+    display(
+        cm_coverage.select(
+            "ticker_region", "company_name",
+            "filing_chunks", "earnings_chunks", "news_chunks", "total_chunks",
+        )
+    )
+else:
+    cm_coverage = None
+    print("No capital-markets names found in EDG.")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 4: Final 20 — at least 2/3 sources, backfill if needed
-
-# COMMAND ----------
-
-multi_source = (
-    combined
-    .where(F.col("source_count") >= 2)
-    .orderBy(F.desc("source_count"), F.desc("filing_chunks"))
-)
-
-multi_source_count = multi_source.count()
-print(f"Companies in >= 2 sources: {multi_source_count}")
-
-single_source = (
-    combined
-    .where(F.col("source_count") < 2)
-    .orderBy(F.desc("filing_chunks"))
-)
+# MAGIC ## Step 4 — Final 20 Recommendation
+# MAGIC
+# MAGIC **Priority:**
+# MAGIC 1. Crosswalk companies with strong document coverage (IN_POSITION_BOOK)
+# MAGIC 2. Fill with capital-markets names for breadth (RESEARCH_ONLY)
 
 # COMMAND ----------
 
 FINAL_N = 20
 
-if multi_source_count >= FINAL_N:
-    final_20 = multi_source.limit(FINAL_N)
-    backfill_count = 0
-else:
-    backfill_needed = FINAL_N - multi_source_count
-    backfill = single_source.limit(backfill_needed)
-    final_20 = multi_source.unionByName(backfill)
-    backfill_count = backfill_needed
+# Rank crosswalk companies by total coverage (descending)
+crosswalk_ranked = (
+    crosswalk_coverage
+    .where(F.col("total_chunks") > 0)
+    .withColumn("source", F.lit("IN_POSITION_BOOK"))
+    .orderBy(F.desc("total_chunks"))
+)
 
-print(f"Multi-source companies selected: {min(multi_source_count, FINAL_N)}")
-print(f"Backfill (filing-only) companies: {backfill_count}")
-print(f"Total: {FINAL_N}")
+crosswalk_qualified = crosswalk_ranked.count()
+print(f"Crosswalk companies with any document coverage: {crosswalk_qualified}")
+
+# COMMAND ----------
+
+if crosswalk_qualified >= FINAL_N:
+    # Enough crosswalk companies — take top 20
+    final_20 = crosswalk_ranked.limit(FINAL_N)
+    fill_count = 0
+else:
+    # Need to fill with capital-markets names
+    fill_needed = FINAL_N - crosswalk_qualified
+    print(f"Need {fill_needed} additional companies from capital-markets list")
+
+    if cm_coverage is not None:
+        cm_ranked = (
+            cm_coverage
+            .withColumn("source", F.lit("RESEARCH_ONLY"))
+            .orderBy(F.desc("total_chunks"))
+            .limit(fill_needed)
+        )
+        fill_count = min(cm_ranked.count(), fill_needed)
+
+        # Ensure schemas align before union
+        select_cols = [
+            "ticker_region", "company_name",
+            "filing_chunks", "earnings_chunks", "news_chunks", "total_chunks",
+            "source",
+        ]
+        final_20 = crosswalk_ranked.select(select_cols).unionByName(
+            cm_ranked.select(select_cols)
+        )
+    else:
+        final_20 = crosswalk_ranked
+        fill_count = 0
+
+print(f"IN_POSITION_BOOK: {min(crosswalk_qualified, FINAL_N)}")
+print(f"RESEARCH_ONLY:    {fill_count}")
+print(f"Total selected:   {min(crosswalk_qualified, FINAL_N) + fill_count}")
 
 # COMMAND ----------
 
@@ -158,22 +452,46 @@ print(f"Total: {FINAL_N}")
 
 final_result = (
     final_20
-    .select("ticker", "company_name", "filing_chunks", "earnings_chunks", "news_chunks")
-    .orderBy(F.desc("filing_chunks"))
+    .select(
+        "ticker_region", "company_name",
+        "filing_chunks", "earnings_chunks", "news_chunks", "total_chunks",
+        "source",
+    )
+    .orderBy(
+        F.when(F.col("source") == "IN_POSITION_BOOK", 0).otherwise(1),
+        F.desc("total_chunks"),
+    )
 )
 
-print("=" * 90)
+print("=" * 120)
 print("SELECTED 20 COMPANIES FOR RESEARCH & DEAL INTELLIGENCE AGENT")
-print("=" * 90)
+print("=" * 120)
 display(final_result)
 
 # COMMAND ----------
 
 rows = final_result.collect()
 
-print(f"\n{'Ticker':<20} {'Company':<35} {'Filings':>10} {'Earnings':>10} {'News':>10}")
-print("-" * 90)
+print(f"\n{'Ticker':<15} {'Company':<35} {'Filings':>10} {'Earnings':>10} {'News':>10} {'Total':>10}  {'Source'}")
+print("-" * 120)
 for row in rows:
-    print(f"{row['ticker']:<20} {row['company_name']:<35} {row['filing_chunks']:>10,} {row['earnings_chunks']:>10,} {row['news_chunks']:>10,}")
-print("-" * 90)
-print(f"{'TOTAL':<20} {'':<35} {sum(r['filing_chunks'] for r in rows):>10,} {sum(r['earnings_chunks'] for r in rows):>10,} {sum(r['news_chunks'] for r in rows):>10,}")
+    print(
+        f"{row['ticker_region']:<15} "
+        f"{(row['company_name'] or '')[:34]:<35} "
+        f"{row['filing_chunks']:>10,} "
+        f"{row['earnings_chunks']:>10,} "
+        f"{row['news_chunks']:>10,} "
+        f"{row['total_chunks']:>10,}  "
+        f"{row['source']}"
+    )
+print("-" * 120)
+
+in_book   = sum(1 for r in rows if r["source"] == "IN_POSITION_BOOK")
+research  = sum(1 for r in rows if r["source"] == "RESEARCH_ONLY")
+print(f"\nIN_POSITION_BOOK: {in_book}   RESEARCH_ONLY: {research}   Total: {len(rows)}")
+print(
+    f"Chunks — Filings: {sum(r['filing_chunks'] for r in rows):>10,}   "
+    f"Earnings: {sum(r['earnings_chunks'] for r in rows):>10,}   "
+    f"News: {sum(r['news_chunks'] for r in rows):>10,}   "
+    f"Grand Total: {sum(r['total_chunks'] for r in rows):>10,}"
+)
