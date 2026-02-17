@@ -1069,11 +1069,9 @@ print("All local agent tests passed.\n")
 
 mlflow.set_registry_uri("databricks-uc")
 
-input_example = {
-    "messages": [
-        {"role": "user", "content": "What is Total Debt/EBITDA for NVDA?"}
-    ],
-}
+# NOTE: input_example is intentionally omitted.  ChatModel defines its own
+# input / output signature automatically, and passing an input_example would
+# trigger a full agent loop (LLM calls + tool execution) during validation.
 
 print(f"Logging model to: {REGISTERED_MODEL_NAME}")
 
@@ -1084,7 +1082,6 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
         name="agent",
         python_model=FactSetResearchAgent(),
         registered_model_name=REGISTERED_MODEL_NAME,
-        input_example=input_example,
         code_paths=[
             os.path.join(repo_root, "src"),
         ],
