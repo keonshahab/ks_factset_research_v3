@@ -52,11 +52,18 @@
 
 import sys, os, json
 
-repo_root = (
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if "__file__" in dir()
-    else "/Workspace/Repos"
-)
+if "__file__" in dir():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+else:
+    # Databricks notebook: derive repo root from the notebook path
+    _nb_path = (
+        dbutils.notebook.entry_point  # noqa: F821
+        .getDbutils().notebook().getContext()
+        .notebookPath().get()
+    )
+    # _nb_path is e.g. "/Repos/<user>/ks_factset_research_v3/notebooks/09d_agent_setup"
+    repo_root = "/Workspace" + str(_nb_path).rsplit("/notebooks/", 1)[0]
+
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
