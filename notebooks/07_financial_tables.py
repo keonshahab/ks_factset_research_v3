@@ -164,22 +164,24 @@ display(spark.table("delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_gu
 
 # COMMAND ----------
 
-ep_df = spark.table("delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles")
-
-# ENTITY_PROFILE is a JSON string — inspect its keys
 from pyspark.sql import functions as F
 
-# Show a sample ENTITY_PROFILE value to discover JSON keys
-sample_json = ep_df.where(F.col("ENTITY_PROFILE").isNotNull()).select("ENTITY_PROFILE").limit(1).collect()
-if sample_json:
-    import json
-    parsed = json.loads(sample_json[0]["ENTITY_PROFILE"])
-    print(f"ENTITY_PROFILE JSON keys ({len(parsed)}):")
-    print("-" * 75)
-    for key, val in parsed.items():
-        print(f"  {key:<45} sample: {str(val)[:40]}")
-else:
-    print("WARNING: No non-null ENTITY_PROFILE values found")
+ep_df = spark.table("delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles")
+
+# ENTITY_PROFILE is a STRING column — print raw samples to understand the format
+print("=== ENTITY_PROFILE raw content (first 500 chars, 3 samples) ===\n")
+samples = (
+    ep_df
+    .where(F.col("ENTITY_PROFILE").isNotNull())
+    .where(F.length(F.col("ENTITY_PROFILE")) > 0)
+    .select("FACTSET_ENTITY_ID", "ENTITY_PROFILE_TYPE", "ENTITY_PROFILE")
+    .limit(3)
+    .collect()
+)
+for i, row in enumerate(samples):
+    print(f"--- Sample {i+1}: {row['FACTSET_ENTITY_ID']} (type={row['ENTITY_PROFILE_TYPE']}) ---")
+    print(row["ENTITY_PROFILE"][:500])
+    print()
 
 # COMMAND ----------
 
@@ -193,7 +195,7 @@ display(spark.sql("""
     SELECT ep.*
     FROM delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles ep
     INNER JOIN target_companies tc ON tc.entity_id = ep.FACTSET_ENTITY_ID
-    LIMIT 3
+    LIMIT 5
 """))
 
 # COMMAND ----------
@@ -201,8 +203,12 @@ display(spark.sql("""
 # MAGIC %md
 # MAGIC ### 2.b — Build company_profile table
 # MAGIC
-# MAGIC `ENTITY_PROFILE` is a JSON string — use `get_json_object` to extract fields.
-# MAGIC Adjust JSON path keys below based on the discovery output in Step 2.a.
+# MAGIC The `ff_entity_profiles` table may not contain structured profile fields directly.
+# MAGIC As a fallback, build the company profile from `sym_entity` (which has proper name,
+# MAGIC country, entity type) joined with the config table's display_name.
+# MAGIC
+# MAGIC **Adjust this cell** after reviewing Step 2.a output — if `ENTITY_PROFILE` contains
+# MAGIC parseable data (JSON, key-value pairs), extract relevant fields from it.
 
 # COMMAND ----------
 
@@ -214,20 +220,18 @@ spark.sql("""
         tc.ticker,
         tc.ticker_region,
         tc.entity_id,
-        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_PROPER_NAME')  AS company_name,
-        get_json_object(ep.ENTITY_PROFILE, '$.ISO_COUNTRY')         AS country,
-        get_json_object(ep.ENTITY_PROFILE, '$.SECTOR_CODE')         AS sector,
-        get_json_object(ep.ENTITY_PROFILE, '$.INDUSTRY_CODE')       AS industry,
-        get_json_object(ep.ENTITY_PROFILE, '$.SUB_INDUSTRY_CODE')   AS sub_industry,
-        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_TYPE')         AS entity_type,
-        get_json_object(ep.ENTITY_PROFILE, '$.YEAR_FOUNDED')        AS year_founded,
-        get_json_object(ep.ENTITY_PROFILE, '$.ISO_COUNTRY_INCORP')  AS country_incorporated,
-        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_SUB_TYPE')     AS entity_sub_type,
-        ep.ENTITY_PROFILE_TYPE,
+        se.ENTITY_PROPER_NAME                   AS company_name,
+        se.ISO_COUNTRY                          AS country,
+        se.ENTITY_TYPE                          AS entity_type,
+        se.ENTITY_SUB_TYPE                      AS entity_sub_type,
+        ep.ENTITY_PROFILE_TYPE                  AS profile_type,
+        ep.ENTITY_PROFILE                       AS profile_raw,
         tc.fsym_id,
         tc.display_name
     FROM target_companies tc
-    INNER JOIN delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles ep
+    INNER JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
+        ON tc.entity_id = se.FACTSET_ENTITY_ID
+    LEFT JOIN delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles ep
         ON tc.entity_id = ep.FACTSET_ENTITY_ID
 """)
 
@@ -597,9 +601,8 @@ display(spark.sql("""
         entity_id,
         company_name,
         country,
-        sector,
-        industry,
-        sub_industry
+        entity_type,
+        display_name
     FROM ks_factset_research_v3.gold.company_profile
     ORDER BY ticker
 """))
