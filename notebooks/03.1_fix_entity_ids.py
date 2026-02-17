@@ -33,6 +33,37 @@
 
 from pyspark.sql import functions as F
 
+# ── Base company names for search and validation ────────────────────────
+# No legal suffixes (Inc., Corp., Co., Ltd.) — keeps LIKE searches broad
+# enough to match regardless of punctuation ("Visa Inc." vs "Visa, Inc.")
+# and makes substring validation work for abbreviations ("amd" wouldn't
+# match "Advanced Micro Devices" but "advanced micro devices" does).
+PROPER_NAMES = {
+    "AAPL": "Apple",
+    "ABBV": "AbbVie",
+    "AMD":  "Advanced Micro Devices",
+    "AMZN": "Amazon",
+    "BAC":  "Bank of America",
+    "CAT":  "Caterpillar",
+    "COST": "Costco Wholesale",
+    "CRM":  "Salesforce",
+    "CVX":  "Chevron",
+    "GOOGL": "Alphabet",
+    "INTC": "Intel",
+    "JNJ":  "Johnson & Johnson",
+    "JPM":  "JPMorgan Chase",
+    "LLY":  "Eli Lilly",
+    "MA":   "Mastercard",
+    "META": "Meta Platforms",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "PG":   "Procter & Gamble",
+    "TSLA": "Tesla",
+    "V":    "Visa",
+    "WMT":  "Walmart",
+    "XOM":  "Exxon Mobil",
+}
+
 mismatch_df = spark.sql("""
     SELECT
         dc.ticker,
@@ -64,9 +95,13 @@ for row in rows:
     country = row["resolved_country"] or ""
 
     # A mapping is correct only if the entity is a non-NULL, US-based PUB
-    # company whose name matches the display name.
+    # company whose name matches the display name or proper name.
     if resolved and entity_type == "PUB" and country == "US":
-        match = display.lower() in resolved.lower() or resolved.lower() in display.lower()
+        proper = PROPER_NAMES.get(row["ticker"], display).lower()
+        res_low = resolved.lower()
+        disp_low = display.lower()
+        match = (disp_low in res_low or res_low in disp_low
+                 or proper in res_low or res_low in proper)
     else:
         match = False  # NULL, non-PUB, or non-US = always a mismatch
 
@@ -97,37 +132,6 @@ if mismatches:
     mismatch_tickers = {row["ticker"]: row for row in mismatches}
     mismatch_ticker_regions = [row["ticker_region"] for row in mismatches]
     mismatch_tr_sql = ", ".join(f"'{tr}'" for tr in mismatch_ticker_regions)
-
-    # ── Full proper names for precise search ──────────────────────────
-    # Short display names like "AMD" or "Intel" are too ambiguous for
-    # a LIKE search against sym_entity (e.g. "Intel" matches
-    # "Intelligent", "AMD" matches "AMD Industries Ltd." in India).
-    # Use the legal-ish name so we can filter to PUB + US reliably.
-    PROPER_NAMES = {
-        "AAPL": "Apple Inc.",
-        "ABBV": "AbbVie Inc.",
-        "AMD":  "Advanced Micro Devices",
-        "AMZN": "Amazon.com",
-        "BAC":  "Bank of America",
-        "CAT":  "Caterpillar Inc.",
-        "COST": "Costco Wholesale",
-        "CRM":  "Salesforce",
-        "CVX":  "Chevron Corp",
-        "GOOGL": "Alphabet Inc.",
-        "INTC": "Intel Corp",
-        "JNJ":  "Johnson & Johnson",
-        "JPM":  "JPMorgan Chase",
-        "LLY":  "Eli Lilly",
-        "MA":   "Mastercard Inc",
-        "META": "Meta Platforms",
-        "MSFT": "Microsoft Corp",
-        "NVDA": "NVIDIA Corp",
-        "PG":   "Procter & Gamble",
-        "TSLA": "Tesla, Inc.",
-        "V":    "Visa Inc.",
-        "WMT":  "Walmart Inc.",
-        "XOM":  "Exxon Mobil",
-    }
 
     # ── Strategy 1: Name search in sym_entity (PUB + US) ─────────────
     # This is the most reliable strategy for well-known US companies.
@@ -364,9 +368,12 @@ for row in val_rows:
     entity_type = row["resolved_type"] or ""
     country = row["resolved_country"] or ""
 
-    # Correct = non-NULL, US-based PUB entity whose name matches display_name
+    # Correct = non-NULL, US-based PUB entity whose name matches display/proper name
     if resolved and entity_type == "PUB" and country == "US":
-        match = display in resolved.lower() or resolved.lower() in display
+        proper = PROPER_NAMES.get(row["ticker"], display).lower()
+        res_low = resolved.lower()
+        match = (display in res_low or res_low in display
+                 or proper in res_low or res_low in proper)
     else:
         match = False
 
