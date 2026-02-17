@@ -76,7 +76,7 @@ _EARNINGS_KEYWORDS = [
 ]
 _NEWS_KEYWORDS = [
     "news", "headline", "analyst", "streetaccount", "press release",
-    "breaking", "report", "upgrade", "downgrade", "rating",
+    "breaking", "analyst report", "upgrade", "downgrade", "rating",
     "acquisition", "merger", "deal",
 ]
 
