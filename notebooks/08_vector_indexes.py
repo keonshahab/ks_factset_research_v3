@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC | Step | Description |
 # MAGIC |------|-------------|
-# MAGIC | 1 | Verify shared Vector Search endpoint |
+# MAGIC | 1 | Parameters & verify Vector Search endpoint |
 # MAGIC | 2 | Create 3 Delta Sync indexes (managed embeddings) |
 # MAGIC | 3 | Trigger sync and poll until ONLINE |
 # MAGIC | 4 | Test each index with `query_text` |
@@ -23,9 +23,11 @@
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 1: Verify Vector Search Endpoint
-# MAGIC
-# MAGIC Using shared endpoint `one-env-shared-endpoint-11` (already provisioned).
+# MAGIC ## Step 1: Parameters & Verify Endpoint
+
+# COMMAND ----------
+
+dbutils.widgets.text("vs_endpoint", "one-env-shared-endpoint-11", "Vector Search endpoint name")
 
 # COMMAND ----------
 
@@ -36,10 +38,12 @@ vsc = VectorSearchClient()
 
 # COMMAND ----------
 
-ENDPOINT_NAME = "one-env-shared-endpoint-11"
+ENDPOINT_NAME = dbutils.widgets.get("vs_endpoint").strip()
 CATALOG = "ks_factset_research_v3"
 SCHEMA = "demo"
 EMBEDDING_MODEL = "databricks-gte-large-en"
+
+print(f"Endpoint: {ENDPOINT_NAME}")
 
 # COMMAND ----------
 
@@ -429,6 +433,7 @@ print("DONE")
 # MAGIC from databricks.vector_search.client import VectorSearchClient
 # MAGIC vsc = VectorSearchClient()
 # MAGIC
+# MAGIC ENDPOINT = dbutils.widgets.get("vs_endpoint").strip()
 # MAGIC index_names = [
 # MAGIC     "ks_factset_research_v3.demo.filing_search_index",
 # MAGIC     "ks_factset_research_v3.demo.earnings_search_index",
@@ -436,6 +441,6 @@ print("DONE")
 # MAGIC ]
 # MAGIC
 # MAGIC for idx in index_names:
-# MAGIC     vsc.get_index("one-env-shared-endpoint-11", idx).sync()
+# MAGIC     vsc.get_index(ENDPOINT, idx).sync()
 # MAGIC     print(f"Sync triggered: {idx}")
 # MAGIC ```
