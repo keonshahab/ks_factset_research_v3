@@ -17,7 +17,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from databricks.vector_search.client import VectorSearchClient
+try:
+    from databricks.vector_search.client import VectorSearchClient
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(
+        "databricks-vectorsearch is not installed. "
+        "Run `%pip install databricks-vectorsearch -q` then "
+        "`dbutils.library.restartPython()` before importing CitationEngine."
+    )
 
 
 # ---------------------------------------------------------------------------

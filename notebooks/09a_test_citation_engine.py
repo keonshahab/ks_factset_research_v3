@@ -18,6 +18,14 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install databricks-vectorsearch -q
+
+# COMMAND ----------
+
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
 import sys, os
 
 # Ensure the repo root is on the Python path so `from src.citation_engine import …` works
