@@ -191,6 +191,10 @@ print(f"  {CATALOG}.{SCHEMA}.position_risk_flags   — compliance flags")
 
 # COMMAND ----------
 
+import importlib
+import src.position_tools
+importlib.reload(src.position_tools)
+
 from src.position_tools import (
     get_firm_exposure,
     get_desk_pnl,
@@ -201,6 +205,8 @@ from src.position_tools import (
     _check_in_position_book,
     _fmt,
 )
+
+print("Module reloaded from disk.")
 
 IN_BOOK_TICKER = "NVDA"
 NOT_IN_BOOK_TICKER = "ZM"
