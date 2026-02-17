@@ -46,7 +46,7 @@ sa_df = spark.table(f"{CATALOG_SCHEMA}.sa_metadata")
 
 edg_top30 = (
     edg_df
-    .withColumn("ticker", F.element_at("primary_symbols", 1))
+    .withColumn("ticker", F.get("primary_symbols", 0))
     .where(F.col("ticker").isNotNull())
     .groupBy("ticker", "company_name")
     .agg(F.count("*").alias("filing_chunks"))
@@ -67,7 +67,7 @@ display(edg_top30)
 
 fcst_counts = (
     fcst_df
-    .withColumn("ticker", F.element_at("primary_symbols", 1))
+    .withColumn("ticker", F.get("primary_symbols", 0))
     .where(F.col("ticker").isNotNull())
     .groupBy("ticker")
     .agg(F.count("*").alias("earnings_chunks"))
@@ -75,7 +75,7 @@ fcst_counts = (
 
 sa_counts = (
     sa_df
-    .withColumn("ticker", F.element_at("primary_symbols", 1))
+    .withColumn("ticker", F.get("primary_symbols", 0))
     .where(F.col("ticker").isNotNull())
     .groupBy("ticker")
     .agg(F.count("*").alias("news_chunks"))
