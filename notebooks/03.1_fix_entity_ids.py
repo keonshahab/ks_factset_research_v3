@@ -41,7 +41,8 @@ mismatch_df = spark.sql("""
         dc.entity_id           AS current_entity_id,
         dc.fsym_id             AS current_fsym_id,
         se.ENTITY_PROPER_NAME  AS resolved_name,
-        se.ENTITY_TYPE         AS resolved_type
+        se.ENTITY_TYPE         AS resolved_type,
+        se.ISO_COUNTRY         AS resolved_country
     FROM ks_factset_research_v3.gold.demo_companies dc
     LEFT JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
         ON dc.entity_id = se.FACTSET_ENTITY_ID
@@ -51,8 +52,8 @@ mismatch_df = spark.sql("""
 
 rows = mismatch_df.collect()
 
-print(f"{'Ticker':<8} {'Display Name':<25} {'Resolved Name':<35} {'Type':<6} {'Match?'}")
-print("-" * 100)
+print(f"{'Ticker':<8} {'Display Name':<25} {'Resolved Name':<35} {'Country':<4} {'Type':<6} {'Match?'}")
+print("-" * 110)
 
 mismatches = []
 for row in rows:
@@ -60,16 +61,17 @@ for row in rows:
     resolved = row["resolved_name"]  # keep as None if NULL
     resolved_str = resolved or "(NULL)"
     entity_type = row["resolved_type"] or "N/A"
+    country = row["resolved_country"] or ""
 
-    # A mapping is correct only if the resolved name is non-NULL, is a PUB
-    # entity, and the display name appears in it (or vice-versa).
-    if resolved and entity_type == "PUB":
+    # A mapping is correct only if the entity is a non-NULL, US-based PUB
+    # company whose name matches the display name.
+    if resolved and entity_type == "PUB" and country == "US":
         match = display.lower() in resolved.lower() or resolved.lower() in display.lower()
     else:
-        match = False  # NULL or non-PUB = always a mismatch
+        match = False  # NULL, non-PUB, or non-US = always a mismatch
 
     flag = "OK" if match else "MISMATCH"
-    print(f"{row['ticker']:<8} {display:<25} {resolved_str:<35} {entity_type:<6} {flag}")
+    print(f"{row['ticker']:<8} {display:<25} {resolved_str:<35} {country or '??':<4} {entity_type:<6} {flag}")
     if not match:
         mismatches.append(row)
 
@@ -341,7 +343,8 @@ validation_df = spark.sql("""
         dc.display_name,
         dc.entity_id,
         se.ENTITY_PROPER_NAME  AS resolved_name,
-        se.ENTITY_TYPE         AS resolved_type
+        se.ENTITY_TYPE         AS resolved_type,
+        se.ISO_COUNTRY         AS resolved_country
     FROM ks_factset_research_v3.gold.demo_companies dc
     LEFT JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
         ON dc.entity_id = se.FACTSET_ENTITY_ID
@@ -351,17 +354,18 @@ validation_df = spark.sql("""
 
 val_rows = validation_df.collect()
 
-print(f"\n{'Ticker':<8} {'Display Name':<25} {'Resolved Name':<35} {'Entity ID':<15} {'Type':<6} {'Match?'}")
-print("-" * 100)
+print(f"\n{'Ticker':<8} {'Display Name':<25} {'Resolved Name':<35} {'Entity ID':<15} {'Country':<4} {'Type':<6} {'Match?'}")
+print("-" * 115)
 
 remaining_mismatches = 0
 for row in val_rows:
     display = (row["display_name"] or "").lower()
     resolved = row["resolved_name"]
     entity_type = row["resolved_type"] or ""
+    country = row["resolved_country"] or ""
 
-    # Correct = non-NULL PUB entity whose name matches display_name
-    if resolved and entity_type == "PUB":
+    # Correct = non-NULL, US-based PUB entity whose name matches display_name
+    if resolved and entity_type == "PUB" and country == "US":
         match = display in resolved.lower() or resolved.lower() in display
     else:
         match = False
@@ -369,7 +373,7 @@ for row in val_rows:
     flag = "OK" if match else "MISMATCH"
     if not match:
         remaining_mismatches += 1
-    print(f"{row['ticker']:<8} {row['display_name'] or '':<25} {row['resolved_name'] or '(NULL)':<35} {row['entity_id'] or '':<15} {row['resolved_type'] or '':<6} {flag}")
+    print(f"{row['ticker']:<8} {row['display_name'] or '':<25} {row['resolved_name'] or '(NULL)':<35} {row['entity_id'] or '':<15} {country or '??':<4} {row['resolved_type'] or '':<6} {flag}")
 
 print(f"\nRemaining mismatches: {remaining_mismatches}")
 
