@@ -17,10 +17,7 @@
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Phase 1: Discover Ticker / Company Columns
-# MAGIC
-# MAGIC We don't hardcode column names — this cell finds candidate columns in each table
-# MAGIC so you can confirm the right ones before running the analysis.
+# MAGIC ## Phase 1: Discover Column Names (schema only — instant)
 
 # COMMAND ----------
 
@@ -35,44 +32,30 @@ sa_df = spark.table(f"{CATALOG_SCHEMA}.sa_metadata")
 
 # COMMAND ----------
 
-def discover_all_columns(df, table_name):
-    """Print every column with type, distinct count, and samples for string cols."""
-    print(f"{'='*100}")
-    print(f"  ALL COLUMNS IN {table_name}  ({df.count():,} rows)")
-    print(f"{'='*100}")
-    print(f"  {'Column':<40} {'Type':<15} {'Distinct':>10}   {'Sample Values'}")
-    print(f"  {'-'*95}")
-
+# Print schema for all three tables — no data scan, instant
+for label, df in [("edg_metadata", edg_df), ("fcst_metadata", fcst_df), ("sa_metadata", sa_df)]:
+    print(f"{'='*60}")
+    print(f"  {label}")
+    print(f"{'='*60}")
     for field in df.schema.fields:
-        col_name = field.name
-        col_type = str(field.dataType).replace("Type", "")
-        is_string = isinstance(field.dataType, StringType)
-
-        if is_string:
-            n_distinct = df.select(F.countDistinct(col_name)).collect()[0][0]
-            samples = (
-                df.select(col_name)
-                .where(F.col(col_name).isNotNull())
-                .distinct()
-                .limit(5)
-                .collect()
-            )
-            sample_vals = [row[0][:40] if row[0] and len(row[0]) > 40 else row[0] for row in samples]
-            print(f"  {col_name:<40} {col_type:<15} {n_distinct:>10,}   {sample_vals}")
-        else:
-            print(f"  {col_name:<40} {col_type:<15}")
-
+        print(f"  {field.name:<40} {str(field.dataType)}")
     print()
 
-discover_all_columns(edg_df, "edg_metadata")
+# COMMAND ----------
+
+# Quick peek at 5 rows from each table — cheap limit() only
+print("=== edg_metadata — 5 sample rows ===")
+display(edg_df.limit(5))
 
 # COMMAND ----------
 
-discover_all_columns(fcst_df, "fcst_metadata")
+print("=== fcst_metadata — 5 sample rows ===")
+display(fcst_df.limit(5))
 
 # COMMAND ----------
 
-discover_all_columns(sa_df, "sa_metadata")
+print("=== sa_metadata — 5 sample rows ===")
+display(sa_df.limit(5))
 
 # COMMAND ----------
 
@@ -80,20 +63,19 @@ discover_all_columns(sa_df, "sa_metadata")
 # MAGIC ---
 # MAGIC ## Phase 2: Configure Column Names
 # MAGIC
-# MAGIC **After running Phase 1**, set the correct column names below.
-# MAGIC These are the columns used for grouping/joining across tables.
+# MAGIC **Review the schemas and samples above**, then set the correct column names.
+# MAGIC
+# MAGIC **STOP:** Do NOT "Run All" past this cell until you have set the column names.
 
 # COMMAND ----------
 
 # ── CONFIGURE THESE after reviewing Phase 1 output ──────────────────────────
 # Replace with the actual column names discovered above.
 # Look for:
-#   - Ticker: a string col with ~hundreds to low-thousands of distinct values,
-#             samples look like stock tickers (e.g. "AAPL", "MSFT-US", "000001-CN")
-#   - Company: a string col with similar cardinality, samples are company names
+#   - Ticker: a string col with values like "AAPL", "MSFT-US", etc.
+#   - Company: a string col with values like "Apple Inc.", "Microsoft Corp", etc.
 #
-# If one table lacks a ticker column, you may need to join through a shared ID
-# (e.g. factset_entity_id, document_id) or use chunk_id → all_docs → product.
+# If a table has no ticker column, you may need to join through a shared ID.
 
 TICKER_COL_EDG  = "CHANGE_ME"   # <-- set from Phase 1 output
 COMPANY_COL_EDG = "CHANGE_ME"   # <-- set from Phase 1 output
@@ -105,6 +87,13 @@ TICKER_COL_SA  = "CHANGE_ME"
 COMPANY_COL_SA = "CHANGE_ME"
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Guard: stop execution if config is not set
+_all_configs = [TICKER_COL_EDG, COMPANY_COL_EDG, TICKER_COL_FCST, COMPANY_COL_FCST, TICKER_COL_SA, COMPANY_COL_SA]
+assert "CHANGE_ME" not in _all_configs, (
+    "⛔ STOP — You must set the column names above before running Phase 3. "
+    "Review the Phase 1 output and replace every CHANGE_ME."
+)
 
 print("Column configuration:")
 print(f"  EDG  → ticker: {TICKER_COL_EDG:<30} company: {COMPANY_COL_EDG}")
