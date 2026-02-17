@@ -273,14 +273,13 @@ spark.sql("""
         ff.FF_FYR                       AS fiscal_year,
         ff.FF_FPNC                      AS fiscal_quarter,
         ff.FF_SALES                     AS revenue,
-        ff.FF_EBITDA                    AS ebitda,
-        ff.FF_NET_INC                   AS net_income,
-        ff.FF_EPS_DIL                   AS eps_diluted,
-        ff.FF_DEBT_TOT                  AS total_debt,
-        ff.FF_INT_EXP                   AS interest_expense,
-        ff.FF_OPER_CF                   AS operating_cash_flow,
-        ff.FF_CAPEX                     AS capex,
-        ff.FF_FREE_CF                   AS free_cash_flow,
+        ff.FF_OPER_INC                  AS operating_income,
+        ff.FF_NET_INCOME                AS net_income,
+        ff.FF_EPS_REPORTED              AS eps,
+        ff.FF_DEBT                      AS total_debt,
+        ff.FF_INT_EXP_TOT              AS interest_expense,
+        ff.FF_FUNDS_OPER_GROSS          AS operating_cash_flow,
+        ff.FF_INVEST_ACTIV_CF           AS investing_cash_flow,
         ff.FF_ASSETS                    AS total_assets,
         ff.FF_SHLDRS_EQ                 AS shareholders_equity,
         ff.CURRENCY                     AS currency,
@@ -301,14 +300,13 @@ spark.sql("""
         ff.FF_FYR                       AS fiscal_year,
         NULL                            AS fiscal_quarter,
         ff.FF_SALES                     AS revenue,
-        ff.FF_EBITDA                    AS ebitda,
-        ff.FF_NET_INC                   AS net_income,
-        ff.FF_EPS_DIL                   AS eps_diluted,
-        ff.FF_DEBT_TOT                  AS total_debt,
-        ff.FF_INT_EXP                   AS interest_expense,
-        ff.FF_OPER_CF                   AS operating_cash_flow,
-        ff.FF_CAPEX                     AS capex,
-        ff.FF_FREE_CF                   AS free_cash_flow,
+        ff.FF_OPER_INC                  AS operating_income,
+        ff.FF_NET_INCOME                AS net_income,
+        ff.FF_EPS_REPORTED              AS eps,
+        ff.FF_DEBT                      AS total_debt,
+        ff.FF_INT_EXP_TOT              AS interest_expense,
+        ff.FF_FUNDS_OPER_GROSS          AS operating_cash_flow,
+        ff.FF_INVEST_ACTIV_CF           AS investing_cash_flow,
         ff.FF_ASSETS                    AS total_assets,
         ff.FF_SHLDRS_EQ                 AS shareholders_equity,
         ff.CURRENCY                     AS currency,
@@ -319,26 +317,25 @@ spark.sql("""
 
     UNION ALL
 
-    -- Last Twelve Months
+    -- Last Twelve Months (no balance sheet or FF_FYR in this table)
     SELECT
         tc.ticker,
         tc.display_name                 AS company_name,
         tc.entity_id,
         ff.DATE                         AS period_date,
         'LTM'                           AS period_type,
-        ff.FF_FYR                       AS fiscal_year,
+        NULL                            AS fiscal_year,
         NULL                            AS fiscal_quarter,
         ff.FF_SALES                     AS revenue,
-        ff.FF_EBITDA                    AS ebitda,
-        ff.FF_NET_INC                   AS net_income,
-        ff.FF_EPS_DIL                   AS eps_diluted,
-        ff.FF_DEBT_TOT                  AS total_debt,
-        ff.FF_INT_EXP                   AS interest_expense,
-        ff.FF_OPER_CF                   AS operating_cash_flow,
-        ff.FF_CAPEX                     AS capex,
-        ff.FF_FREE_CF                   AS free_cash_flow,
-        ff.FF_ASSETS                    AS total_assets,
-        ff.FF_SHLDRS_EQ                 AS shareholders_equity,
+        ff.FF_OPER_INC                  AS operating_income,
+        ff.FF_NET_INCOME                AS net_income,
+        ff.FF_EPS_REPORTED              AS eps,
+        NULL                            AS total_debt,
+        ff.FF_INT_EXP_TOT              AS interest_expense,
+        ff.FF_FUNDS_OPER_GROSS          AS operating_cash_flow,
+        ff.FF_INVEST_ACTIV_CF           AS investing_cash_flow,
+        NULL                            AS total_assets,
+        NULL                            AS shareholders_equity,
         ff.CURRENCY                     AS currency,
         'ff_basic_ltm'                  AS source_table
     FROM delta_share_factset_do_not_delete_or_edit.ff_v3.ff_basic_ltm ff
@@ -374,6 +371,7 @@ print(f"company_financials created with {fin_count:,} rows")
 # COMMAND ----------
 
 # Build temporary views for each estimates source, filtered to target companies
+# Actuals: long format — one row per (FSYM_ID, FE_ITEM, FE_FP_END)
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW v_actuals AS
     SELECT
@@ -381,13 +379,10 @@ spark.sql("""
         tc.display_name     AS company_name,
         tc.entity_id,
         tc.fsym_id,
-        act.DATE            AS period_date,
+        act.FE_FP_END       AS period_date,
         act.CURRENCY        AS currency,
-        act.FE_FY           AS fiscal_year,
-        act.FE_FQN          AS fiscal_quarter,
-        act.FE_EPS          AS actual_eps,
-        act.FE_SALES        AS actual_revenue,
-        act.FE_EBITDA       AS actual_ebitda
+        act.FE_ITEM         AS metric_name,
+        act.ACTUAL_VALUE    AS actual_value
     FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_act_qf act
     INNER JOIN target_companies tc
         ON act.FSYM_ID = tc.fsym_id
@@ -395,49 +390,56 @@ spark.sql("""
 
 # COMMAND ----------
 
+# Consensus: long format — use most recent consensus snapshot per item/period
+# (max CONS_START_DATE gives the latest consensus before the period ended)
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW v_consensus AS
     SELECT
-        tc.fsym_id,
-        con.FE_FY           AS fiscal_year,
-        con.FE_FQN          AS fiscal_quarter,
-        con.FE_MEAN_EPS     AS cons_mean_eps,
-        con.FE_HIGH_EPS     AS cons_high_eps,
-        con.FE_LOW_EPS      AS cons_low_eps,
-        con.FE_MEAN_SALES   AS cons_mean_revenue,
-        con.FE_HIGH_SALES   AS cons_high_revenue,
-        con.FE_LOW_SALES    AS cons_low_revenue,
-        con.FE_MEAN_EBITDA  AS cons_mean_ebitda,
-        con.FE_HIGH_EBITDA  AS cons_high_ebitda,
-        con.FE_LOW_EBITDA   AS cons_low_ebitda
+        con.FSYM_ID         AS fsym_id,
+        con.FE_ITEM         AS metric_name,
+        con.FE_FP_END       AS period_date,
+        con.FE_MEAN         AS consensus_mean,
+        con.FE_HIGH         AS consensus_high,
+        con.FE_LOW          AS consensus_low,
+        con.FE_NUM_EST      AS num_estimates
     FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf con
     INNER JOIN target_companies tc
         ON con.FSYM_ID = tc.fsym_id
+    INNER JOIN (
+        SELECT FSYM_ID, FE_ITEM, FE_FP_END, MAX(CONS_START_DATE) AS max_start
+        FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf
+        GROUP BY FSYM_ID, FE_ITEM, FE_FP_END
+    ) latest
+        ON con.FSYM_ID = latest.FSYM_ID
+        AND con.FE_ITEM = latest.FE_ITEM
+        AND con.FE_FP_END = latest.FE_FP_END
+        AND con.CONS_START_DATE = latest.max_start
 """)
 
 # COMMAND ----------
 
+# Guidance: long format — pivot LOW/HIGH into columns per item/period
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW v_guidance AS
     SELECT
-        tc.fsym_id,
-        guid.FE_FY          AS fiscal_year,
-        guid.FE_FQN         AS fiscal_quarter,
-        guid.FE_GUID_EPS_LOW    AS guid_eps_low,
-        guid.FE_GUID_EPS_HIGH   AS guid_eps_high,
-        guid.FE_GUID_SALES_LOW  AS guid_revenue_low,
-        guid.FE_GUID_SALES_HIGH AS guid_revenue_high,
-        guid.FE_GUID_EBITDA_LOW AS guid_ebitda_low,
-        guid.FE_GUID_EBITDA_HIGH AS guid_ebitda_high
-    FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_guid_qf guid
+        g.FSYM_ID           AS fsym_id,
+        g.FE_ITEM           AS metric_name,
+        g.FE_FP_END         AS period_date,
+        MAX(CASE WHEN g.GUIDANCE_TYPE = 'LOW'  THEN g.GUIDANCE_VALUE END) AS guidance_low,
+        MAX(CASE WHEN g.GUIDANCE_TYPE = 'HIGH' THEN g.GUIDANCE_VALUE END) AS guidance_high
+    FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_guid_qf g
     INNER JOIN target_companies tc
-        ON guid.FSYM_ID = tc.fsym_id
+        ON g.FSYM_ID = tc.fsym_id
+    GROUP BY g.FSYM_ID, g.FE_ITEM, g.FE_FP_END
 """)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4.1 — Combine and unpivot into long format
+# MAGIC ### 4.1 — Combine actuals + consensus + guidance
+# MAGIC
+# MAGIC All three source tables are already in long format keyed by
+# MAGIC `(FSYM_ID, FE_ITEM, FE_FP_END)`. Join them and compute surprise metrics.
 
 # COMMAND ----------
 
@@ -445,121 +447,40 @@ spark.sql("""
     CREATE OR REPLACE TABLE ks_factset_research_v3.gold.consensus_estimates
     USING DELTA
     AS
-
-    -- EPS
     SELECT
         a.ticker,
         a.company_name,
         a.entity_id,
         a.period_date,
-        a.fiscal_year,
-        a.fiscal_quarter,
-        'EPS'                           AS metric_name,
-        a.actual_eps                    AS actual_value,
-        c.cons_mean_eps                 AS consensus_mean,
-        c.cons_high_eps                 AS consensus_high,
-        c.cons_low_eps                  AS consensus_low,
-        CASE WHEN a.actual_eps IS NOT NULL AND c.cons_mean_eps IS NOT NULL
-             THEN a.actual_eps - c.cons_mean_eps END
+        a.metric_name,
+        a.actual_value,
+        c.consensus_mean,
+        c.consensus_high,
+        c.consensus_low,
+        c.num_estimates,
+        CASE WHEN a.actual_value IS NOT NULL AND c.consensus_mean IS NOT NULL
+             THEN a.actual_value - c.consensus_mean END
                                         AS surprise,
-        CASE WHEN a.actual_eps IS NOT NULL AND c.cons_mean_eps IS NOT NULL
-                  AND c.cons_mean_eps != 0
-             THEN (a.actual_eps - c.cons_mean_eps) / ABS(c.cons_mean_eps) * 100
+        CASE WHEN a.actual_value IS NOT NULL AND c.consensus_mean IS NOT NULL
+                  AND c.consensus_mean != 0
+             THEN (a.actual_value - c.consensus_mean) / ABS(c.consensus_mean) * 100
              END                        AS surprise_pct,
-        CASE WHEN a.actual_eps IS NOT NULL AND c.cons_mean_eps IS NOT NULL THEN
-             CASE WHEN a.actual_eps > c.cons_mean_eps THEN 'BEAT'
-                  WHEN a.actual_eps < c.cons_mean_eps THEN 'MISS'
+        CASE WHEN a.actual_value IS NOT NULL AND c.consensus_mean IS NOT NULL THEN
+             CASE WHEN a.actual_value > c.consensus_mean THEN 'BEAT'
+                  WHEN a.actual_value < c.consensus_mean THEN 'MISS'
                   ELSE 'MEET' END
              END                        AS beat_miss,
-        g.guid_eps_low                  AS guidance_low,
-        g.guid_eps_high                 AS guidance_high
+        g.guidance_low,
+        g.guidance_high
     FROM v_actuals a
     LEFT JOIN v_consensus c
         ON a.fsym_id = c.fsym_id
-        AND a.fiscal_year = c.fiscal_year
-        AND a.fiscal_quarter = c.fiscal_quarter
+        AND a.metric_name = c.metric_name
+        AND a.period_date = c.period_date
     LEFT JOIN v_guidance g
         ON a.fsym_id = g.fsym_id
-        AND a.fiscal_year = g.fiscal_year
-        AND a.fiscal_quarter = g.fiscal_quarter
-
-    UNION ALL
-
-    -- Revenue
-    SELECT
-        a.ticker,
-        a.company_name,
-        a.entity_id,
-        a.period_date,
-        a.fiscal_year,
-        a.fiscal_quarter,
-        'Revenue'                       AS metric_name,
-        a.actual_revenue                AS actual_value,
-        c.cons_mean_revenue             AS consensus_mean,
-        c.cons_high_revenue             AS consensus_high,
-        c.cons_low_revenue              AS consensus_low,
-        CASE WHEN a.actual_revenue IS NOT NULL AND c.cons_mean_revenue IS NOT NULL
-             THEN a.actual_revenue - c.cons_mean_revenue END
-                                        AS surprise,
-        CASE WHEN a.actual_revenue IS NOT NULL AND c.cons_mean_revenue IS NOT NULL
-                  AND c.cons_mean_revenue != 0
-             THEN (a.actual_revenue - c.cons_mean_revenue) / ABS(c.cons_mean_revenue) * 100
-             END                        AS surprise_pct,
-        CASE WHEN a.actual_revenue IS NOT NULL AND c.cons_mean_revenue IS NOT NULL THEN
-             CASE WHEN a.actual_revenue > c.cons_mean_revenue THEN 'BEAT'
-                  WHEN a.actual_revenue < c.cons_mean_revenue THEN 'MISS'
-                  ELSE 'MEET' END
-             END                        AS beat_miss,
-        g.guid_revenue_low              AS guidance_low,
-        g.guid_revenue_high             AS guidance_high
-    FROM v_actuals a
-    LEFT JOIN v_consensus c
-        ON a.fsym_id = c.fsym_id
-        AND a.fiscal_year = c.fiscal_year
-        AND a.fiscal_quarter = c.fiscal_quarter
-    LEFT JOIN v_guidance g
-        ON a.fsym_id = g.fsym_id
-        AND a.fiscal_year = g.fiscal_year
-        AND a.fiscal_quarter = g.fiscal_quarter
-
-    UNION ALL
-
-    -- EBITDA
-    SELECT
-        a.ticker,
-        a.company_name,
-        a.entity_id,
-        a.period_date,
-        a.fiscal_year,
-        a.fiscal_quarter,
-        'EBITDA'                        AS metric_name,
-        a.actual_ebitda                 AS actual_value,
-        c.cons_mean_ebitda              AS consensus_mean,
-        c.cons_high_ebitda              AS consensus_high,
-        c.cons_low_ebitda               AS consensus_low,
-        CASE WHEN a.actual_ebitda IS NOT NULL AND c.cons_mean_ebitda IS NOT NULL
-             THEN a.actual_ebitda - c.cons_mean_ebitda END
-                                        AS surprise,
-        CASE WHEN a.actual_ebitda IS NOT NULL AND c.cons_mean_ebitda IS NOT NULL
-                  AND c.cons_mean_ebitda != 0
-             THEN (a.actual_ebitda - c.cons_mean_ebitda) / ABS(c.cons_mean_ebitda) * 100
-             END                        AS surprise_pct,
-        CASE WHEN a.actual_ebitda IS NOT NULL AND c.cons_mean_ebitda IS NOT NULL THEN
-             CASE WHEN a.actual_ebitda > c.cons_mean_ebitda THEN 'BEAT'
-                  WHEN a.actual_ebitda < c.cons_mean_ebitda THEN 'MISS'
-                  ELSE 'MEET' END
-             END                        AS beat_miss,
-        g.guid_ebitda_low               AS guidance_low,
-        g.guid_ebitda_high              AS guidance_high
-    FROM v_actuals a
-    LEFT JOIN v_consensus c
-        ON a.fsym_id = c.fsym_id
-        AND a.fiscal_year = c.fiscal_year
-        AND a.fiscal_quarter = c.fiscal_quarter
-    LEFT JOIN v_guidance g
-        ON a.fsym_id = g.fsym_id
-        AND a.fiscal_year = g.fiscal_year
-        AND a.fiscal_quarter = g.fiscal_quarter
+        AND a.metric_name = g.metric_name
+        AND a.period_date = g.period_date
 """)
 
 est_count = spark.table("ks_factset_research_v3.gold.consensus_estimates").count()
@@ -620,8 +541,9 @@ display(spark.sql("""
         fiscal_year,
         fiscal_quarter,
         revenue,
-        ebitda,
-        eps_diluted
+        operating_income,
+        net_income,
+        eps
     FROM ks_factset_research_v3.gold.company_financials
     WHERE ticker = 'NVDA'
       AND period_type = 'Q'
@@ -639,8 +561,7 @@ display(spark.sql("""
 display(spark.sql("""
     SELECT
         ticker,
-        fiscal_year,
-        fiscal_quarter,
+        period_date,
         metric_name,
         actual_value,
         consensus_mean,
@@ -649,7 +570,7 @@ display(spark.sql("""
         beat_miss
     FROM ks_factset_research_v3.gold.consensus_estimates
     WHERE ticker = 'NVDA'
-    ORDER BY fiscal_year DESC, fiscal_quarter DESC, metric_name
+    ORDER BY period_date DESC, metric_name
     LIMIT 12
 """))
 
