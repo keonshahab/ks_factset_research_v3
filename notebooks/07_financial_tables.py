@@ -166,20 +166,20 @@ display(spark.table("delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_gu
 
 ep_df = spark.table("delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles")
 
-# Show the schema of the ENTITY_PROFILE column (struct fields)
-profile_field = [f for f in ep_df.schema.fields if f.name == "ENTITY_PROFILE"][0]
-print(f"ENTITY_PROFILE data type: {profile_field.dataType}")
-print()
+# ENTITY_PROFILE is a JSON string — inspect its keys
+from pyspark.sql import functions as F
 
-# If it's a struct, list its sub-fields
-if hasattr(profile_field.dataType, 'fields'):
-    print(f"{'Sub-field Name':<45} {'Data Type':<30}")
+# Show a sample ENTITY_PROFILE value to discover JSON keys
+sample_json = ep_df.where(F.col("ENTITY_PROFILE").isNotNull()).select("ENTITY_PROFILE").limit(1).collect()
+if sample_json:
+    import json
+    parsed = json.loads(sample_json[0]["ENTITY_PROFILE"])
+    print(f"ENTITY_PROFILE JSON keys ({len(parsed)}):")
     print("-" * 75)
-    for sub in profile_field.dataType.fields:
-        print(f"{sub.name:<45} {str(sub.dataType):<30}")
+    for key, val in parsed.items():
+        print(f"  {key:<45} sample: {str(val)[:40]}")
 else:
-    print("ENTITY_PROFILE is not a struct — printing raw type for inspection:")
-    print(profile_field.dataType)
+    print("WARNING: No non-null ENTITY_PROFILE values found")
 
 # COMMAND ----------
 
@@ -201,8 +201,8 @@ display(spark.sql("""
 # MAGIC %md
 # MAGIC ### 2.b — Build company_profile table
 # MAGIC
-# MAGIC Extract fields from the `ENTITY_PROFILE` struct. Adjust field names below
-# MAGIC based on the sub-field discovery in Step 2.a.
+# MAGIC `ENTITY_PROFILE` is a JSON string — use `get_json_object` to extract fields.
+# MAGIC Adjust JSON path keys below based on the discovery output in Step 2.a.
 
 # COMMAND ----------
 
@@ -214,15 +214,15 @@ spark.sql("""
         tc.ticker,
         tc.ticker_region,
         tc.entity_id,
-        ep.ENTITY_PROFILE.ENTITY_PROPER_NAME    AS company_name,
-        ep.ENTITY_PROFILE.ISO_COUNTRY            AS country,
-        ep.ENTITY_PROFILE.SECTOR_CODE            AS sector,
-        ep.ENTITY_PROFILE.INDUSTRY_CODE          AS industry,
-        ep.ENTITY_PROFILE.SUB_INDUSTRY_CODE      AS sub_industry,
-        ep.ENTITY_PROFILE.ENTITY_TYPE            AS entity_type,
-        ep.ENTITY_PROFILE.YEAR_FOUNDED           AS year_founded,
-        ep.ENTITY_PROFILE.ISO_COUNTRY_INCORP     AS country_incorporated,
-        ep.ENTITY_PROFILE.ENTITY_SUB_TYPE        AS entity_sub_type,
+        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_PROPER_NAME')  AS company_name,
+        get_json_object(ep.ENTITY_PROFILE, '$.ISO_COUNTRY')         AS country,
+        get_json_object(ep.ENTITY_PROFILE, '$.SECTOR_CODE')         AS sector,
+        get_json_object(ep.ENTITY_PROFILE, '$.INDUSTRY_CODE')       AS industry,
+        get_json_object(ep.ENTITY_PROFILE, '$.SUB_INDUSTRY_CODE')   AS sub_industry,
+        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_TYPE')         AS entity_type,
+        get_json_object(ep.ENTITY_PROFILE, '$.YEAR_FOUNDED')        AS year_founded,
+        get_json_object(ep.ENTITY_PROFILE, '$.ISO_COUNTRY_INCORP')  AS country_incorporated,
+        get_json_object(ep.ENTITY_PROFILE, '$.ENTITY_SUB_TYPE')     AS entity_sub_type,
         ep.ENTITY_PROFILE_TYPE,
         tc.fsym_id,
         tc.display_name
