@@ -220,7 +220,7 @@ spark.sql("""
         tc.ticker,
         tc.ticker_region,
         tc.entity_id,
-        se.ENTITY_PROPER_NAME                   AS company_name,
+        COALESCE(se.ENTITY_PROPER_NAME, tc.display_name) AS company_name,
         se.ISO_COUNTRY                          AS country,
         se.ENTITY_TYPE                          AS entity_type,
         ep.ENTITY_PROFILE_TYPE                  AS profile_type,
@@ -228,7 +228,7 @@ spark.sql("""
         tc.fsym_id,
         tc.display_name
     FROM target_companies tc
-    INNER JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
+    LEFT JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
         ON tc.entity_id = se.FACTSET_ENTITY_ID
     LEFT JOIN delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles ep
         ON tc.entity_id = ep.FACTSET_ENTITY_ID
