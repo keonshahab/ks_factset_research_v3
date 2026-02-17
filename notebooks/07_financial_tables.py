@@ -149,11 +149,60 @@ display(spark.table("delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_gu
 # MAGIC `ks_factset_research_v3.gold.company_profile` — one row per company, from
 # MAGIC `ff_entity_profiles` joined to `target_companies` on `entity_id`.
 # MAGIC
+# MAGIC The `ff_entity_profiles` table stores profile data in a nested `ENTITY_PROFILE` column
+# MAGIC (struct/map). We extract fields from it and pivot by `ENTITY_PROFILE_TYPE` if needed.
+# MAGIC
 # MAGIC **Output columns:** ticker, ticker_region, entity_id, company_name, country, sector,
 # MAGIC industry, sub_industry, plus other useful profile fields.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.a — Inspect ENTITY_PROFILE structure
 # MAGIC
-# MAGIC > **NOTE:** Column names below use standard FactSet FF naming conventions.
-# MAGIC > Verify against the Step 1 schema output and adjust if any names differ.
+# MAGIC Discover the nested field names inside the ENTITY_PROFILE column.
+
+# COMMAND ----------
+
+ep_df = spark.table("delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles")
+
+# Show the schema of the ENTITY_PROFILE column (struct fields)
+profile_field = [f for f in ep_df.schema.fields if f.name == "ENTITY_PROFILE"][0]
+print(f"ENTITY_PROFILE data type: {profile_field.dataType}")
+print()
+
+# If it's a struct, list its sub-fields
+if hasattr(profile_field.dataType, 'fields'):
+    print(f"{'Sub-field Name':<45} {'Data Type':<30}")
+    print("-" * 75)
+    for sub in profile_field.dataType.fields:
+        print(f"{sub.name:<45} {str(sub.dataType):<30}")
+else:
+    print("ENTITY_PROFILE is not a struct — printing raw type for inspection:")
+    print(profile_field.dataType)
+
+# COMMAND ----------
+
+# Show distinct ENTITY_PROFILE_TYPE values
+display(ep_df.select("ENTITY_PROFILE_TYPE").distinct().orderBy("ENTITY_PROFILE_TYPE"))
+
+# COMMAND ----------
+
+# Sample: show ENTITY_PROFILE content for one of our target companies
+display(spark.sql("""
+    SELECT ep.*
+    FROM delta_share_factset_do_not_delete_or_edit.ff_v3.ff_entity_profiles ep
+    INNER JOIN target_companies tc ON tc.entity_id = ep.FACTSET_ENTITY_ID
+    LIMIT 3
+"""))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.b — Build company_profile table
+# MAGIC
+# MAGIC Extract fields from the `ENTITY_PROFILE` struct. Adjust field names below
+# MAGIC based on the sub-field discovery in Step 2.a.
 
 # COMMAND ----------
 
@@ -165,15 +214,16 @@ spark.sql("""
         tc.ticker,
         tc.ticker_region,
         tc.entity_id,
-        ep.ENTITY_PROPER_NAME           AS company_name,
-        ep.ISO_COUNTRY                  AS country,
-        ep.SECTOR_CODE                  AS sector,
-        ep.INDUSTRY_CODE                AS industry,
-        ep.SUB_INDUSTRY_CODE            AS sub_industry,
-        ep.ENTITY_TYPE                  AS entity_type,
-        ep.YEAR_FOUNDED                 AS year_founded,
-        ep.ISO_COUNTRY_INCORP           AS country_incorporated,
-        ep.ENTITY_SUB_TYPE              AS entity_sub_type,
+        ep.ENTITY_PROFILE.ENTITY_PROPER_NAME    AS company_name,
+        ep.ENTITY_PROFILE.ISO_COUNTRY            AS country,
+        ep.ENTITY_PROFILE.SECTOR_CODE            AS sector,
+        ep.ENTITY_PROFILE.INDUSTRY_CODE          AS industry,
+        ep.ENTITY_PROFILE.SUB_INDUSTRY_CODE      AS sub_industry,
+        ep.ENTITY_PROFILE.ENTITY_TYPE            AS entity_type,
+        ep.ENTITY_PROFILE.YEAR_FOUNDED           AS year_founded,
+        ep.ENTITY_PROFILE.ISO_COUNTRY_INCORP     AS country_incorporated,
+        ep.ENTITY_PROFILE.ENTITY_SUB_TYPE        AS entity_sub_type,
+        ep.ENTITY_PROFILE_TYPE,
         tc.fsym_id,
         tc.display_name
     FROM target_companies tc
