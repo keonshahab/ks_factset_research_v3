@@ -157,13 +157,36 @@ for row in ent_tables:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### 2.7 — sym_coverage Schema & Sample
+# MAGIC
+# MAGIC `sym_coverage` bridges regional (`-R`) and security (`-S`) FSYM_IDs.
+
+# COMMAND ----------
+
+cov_df = spark.table("delta_share_factset_do_not_delete_or_edit.sym_v1.sym_coverage")
+
+print("=== sym_coverage schema ===")
+for f in cov_df.schema.fields:
+    print(f"  {f.name:<40} {str(f.dataType)}")
+
+print(f"\nRow count: {cov_df.count():,}")
+
+# COMMAND ----------
+
+print("=== sym_coverage sample (5 rows) ===")
+display(cov_df.limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ---
 # MAGIC ## Step 3: Create `ticker_entity_map`
 # MAGIC
-# MAGIC Join three FactSet Delta Share tables:
-# MAGIC - **sym_ticker_region** — maps `FSYM_ID` → ticker + region
-# MAGIC - **ent_scr_sec_entity** — maps `FSYM_ID` → `FACTSET_ENTITY_ID`
-# MAGIC - **sym_entity** — maps `FACTSET_ENTITY_ID` → company name, country, entity type
+# MAGIC **Problem:** `sym_ticker_region` uses regional FSYM_IDs (`-R`) while
+# MAGIC `ent_scr_sec_entity` uses security FSYM_IDs (`-S`). They share the same
+# MAGIC base ID but different suffixes, so a direct JOIN produces 0 rows.
+# MAGIC
+# MAGIC **Solution:** Join on the base FSYM_ID (strip the `-R` / `-S` suffix).
 # MAGIC
 # MAGIC Filter to `ENTITY_TYPE = 'PUB'` (public companies only).
 
@@ -180,7 +203,7 @@ spark.sql("""
         tr.FSYM_ID             AS fsym_id
     FROM delta_share_factset_do_not_delete_or_edit.sym_v1.sym_ticker_region tr
     JOIN delta_share_factset_do_not_delete_or_edit.ent_v1.ent_scr_sec_entity ese
-        ON tr.FSYM_ID = ese.FSYM_ID
+        ON regexp_extract(tr.FSYM_ID, '^(.+)-', 1) = regexp_extract(ese.FSYM_ID, '^(.+)-', 1)
     JOIN delta_share_factset_do_not_delete_or_edit.sym_v1.sym_entity se
         ON ese.FACTSET_ENTITY_ID = se.FACTSET_ENTITY_ID
     WHERE se.ENTITY_TYPE = 'PUB'
