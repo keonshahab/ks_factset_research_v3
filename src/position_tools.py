@@ -199,8 +199,8 @@ def get_firm_exposure(
     # Breakdown by desk
     desk_rows = _safe_query(spark, f"""
         SELECT desk,
-               SUM(notional) AS notional,
-               COUNT(*) AS positions
+               SUM(notional) AS total_notional,
+               COUNT(*) AS num_positions
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
@@ -211,8 +211,8 @@ def get_firm_exposure(
     # Breakdown by asset_class
     ac_rows = _safe_query(spark, f"""
         SELECT asset_class,
-               SUM(notional) AS notional,
-               COUNT(*) AS positions
+               SUM(notional) AS total_notional,
+               COUNT(*) AS num_positions
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
@@ -223,8 +223,8 @@ def get_firm_exposure(
     # Breakdown by book_type
     bt_rows = _safe_query(spark, f"""
         SELECT book_type,
-               SUM(notional) AS notional,
-               COUNT(*) AS positions
+               SUM(notional) AS total_notional,
+               COUNT(*) AS num_positions
         FROM {POSITIONS_TABLE}
         WHERE ticker_region = '{ticker_region}'
           AND position_date = '{as_of_date}'
@@ -249,27 +249,27 @@ def get_firm_exposure(
             "by_desk": [
                 {
                     "desk": r["desk"],
-                    "notional": _fmt(r["notional"]),
-                    "notional_raw": r["notional"],
-                    "positions": r["positions"],
+                    "notional": _fmt(r["total_notional"]),
+                    "notional_raw": r["total_notional"],
+                    "positions": r["num_positions"],
                 }
                 for r in desk_rows
             ],
             "by_asset_class": [
                 {
                     "asset_class": r["asset_class"],
-                    "notional": _fmt(r["notional"]),
-                    "notional_raw": r["notional"],
-                    "positions": r["positions"],
+                    "notional": _fmt(r["total_notional"]),
+                    "notional_raw": r["total_notional"],
+                    "positions": r["num_positions"],
                 }
                 for r in ac_rows
             ],
             "by_book_type": [
                 {
                     "book_type": r["book_type"],
-                    "notional": _fmt(r["notional"]),
-                    "notional_raw": r["notional"],
-                    "positions": r["positions"],
+                    "notional": _fmt(r["total_notional"]),
+                    "notional_raw": r["total_notional"],
+                    "positions": r["num_positions"],
                 }
                 for r in bt_rows
             ],
