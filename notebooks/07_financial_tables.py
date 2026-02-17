@@ -223,7 +223,6 @@ spark.sql("""
         se.ENTITY_PROPER_NAME                   AS company_name,
         se.ISO_COUNTRY                          AS country,
         se.ENTITY_TYPE                          AS entity_type,
-        se.ENTITY_SUB_TYPE                      AS entity_sub_type,
         ep.ENTITY_PROFILE_TYPE                  AS profile_type,
         ep.ENTITY_PROFILE                       AS profile_raw,
         tc.fsym_id,
