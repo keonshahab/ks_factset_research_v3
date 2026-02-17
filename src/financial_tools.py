@@ -396,19 +396,22 @@ def check_covenant_compliance(
     for covenant, threshold in covenants.items():
         if covenant == "debt_to_equity":
             actual = lev.get("debt_to_equity_raw")
-            compliant = actual is not None and actual <= threshold
         elif covenant == "debt_to_assets":
             actual = lev.get("debt_to_assets_raw")
-            compliant = actual is not None and actual <= threshold
         elif covenant == "min_dscr":
             actual = dscr_res.get("dscr_raw")
-            compliant = actual is not None and actual >= threshold
         else:
             actual = None
-            compliant = None
+
+        if actual is None:
+            compliant = None  # UNKNOWN — data not available
+        elif covenant == "min_dscr":
+            compliant = actual >= threshold
+        else:
+            compliant = actual <= threshold
 
         actual_str = _fmt(actual, is_ratio=True) if actual is not None else "N/A"
-        status = "COMPLIANT" if compliant else ("BREACH" if compliant is False else "UNKNOWN")
+        status = "COMPLIANT" if compliant is True else ("BREACH" if compliant is False else "UNKNOWN")
         results[covenant] = {
             "threshold": threshold,
             "actual": actual_str,
