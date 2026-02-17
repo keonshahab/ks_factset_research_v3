@@ -391,35 +391,30 @@ spark.sql("""
 # COMMAND ----------
 
 # Consensus: long format — use most recent consensus snapshot per item/period
-# (max CONS_START_DATE gives the latest consensus before the period ended)
-# Materialize the max start date first to avoid a self-join on the Delta Share table
-spark.sql("""
-    CREATE OR REPLACE TEMP VIEW v_cons_latest AS
-    SELECT FSYM_ID, FE_ITEM, FE_FP_END, MAX(CONS_START_DATE) AS max_start
-    FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf
-    GROUP BY FSYM_ID, FE_ITEM, FE_FP_END
-""")
-# Cache it so Spark doesn't fold it back into a self-join
-spark.table("v_cons_latest").cache().count()
-
+# Use ROW_NUMBER window function to pick latest consensus per item/period
+# in a single pass — avoids the self-join that Delta Share blocks
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW v_consensus AS
-    SELECT
-        con.FSYM_ID         AS fsym_id,
-        con.FE_ITEM         AS metric_name,
-        con.FE_FP_END       AS period_date,
-        con.FE_MEAN         AS consensus_mean,
-        con.FE_HIGH         AS consensus_high,
-        con.FE_LOW          AS consensus_low,
-        con.FE_NUM_EST      AS num_estimates
-    FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf con
-    INNER JOIN target_companies tc
-        ON con.FSYM_ID = tc.fsym_id
-    INNER JOIN v_cons_latest latest
-        ON con.FSYM_ID = latest.FSYM_ID
-        AND con.FE_ITEM = latest.FE_ITEM
-        AND con.FE_FP_END = latest.FE_FP_END
-        AND con.CONS_START_DATE = latest.max_start
+    SELECT fsym_id, metric_name, period_date,
+           consensus_mean, consensus_high, consensus_low, num_estimates
+    FROM (
+        SELECT
+            con.FSYM_ID         AS fsym_id,
+            con.FE_ITEM         AS metric_name,
+            con.FE_FP_END       AS period_date,
+            con.FE_MEAN         AS consensus_mean,
+            con.FE_HIGH         AS consensus_high,
+            con.FE_LOW          AS consensus_low,
+            con.FE_NUM_EST      AS num_estimates,
+            ROW_NUMBER() OVER (
+                PARTITION BY con.FSYM_ID, con.FE_ITEM, con.FE_FP_END
+                ORDER BY con.CONS_START_DATE DESC
+            ) AS rn
+        FROM delta_share_factset_do_not_delete_or_edit.fe_v4.fe_basic_conh_qf con
+        INNER JOIN target_companies tc
+            ON con.FSYM_ID = tc.fsym_id
+    )
+    WHERE rn = 1
 """)
 
 # COMMAND ----------
