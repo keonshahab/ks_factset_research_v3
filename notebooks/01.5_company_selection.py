@@ -9,7 +9,8 @@
 # MAGIC 1. Pull the 43 tickers from `ks_position_sample.vendor_data.factset_symbology_xref` (the crosswalk)
 # MAGIC 2. For each, count chunks in `edg_metadata` / `fcst_metadata` / `sa_metadata` — matching on `ticker_region` vs `primary_symbols[0]`
 # MAGIC 3. Search additional capital-markets names **not** in the crosswalk but present in `edg_metadata`
-# MAGIC 4. Pick top 20: prioritise crosswalk companies with strong coverage, fill with capital-markets names
+# MAGIC 4. Drop crosswalk tickers with 0 filing coverage; replace with the best CM names
+# MAGIC 5. Pick top 20: prioritise crosswalk companies with strong coverage, fill with capital-markets names
 # MAGIC
 # MAGIC **Note:** The crosswalk table has no `company_name` column — company names are resolved from `edg_metadata`.
 # MAGIC
@@ -163,6 +164,25 @@ display(
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### 2e — Diagnostic: JPM & MSFT filing detail
+
+# COMMAND ----------
+
+jpm_msft_detail = spark.sql("""
+    SELECT document_id, company_name, fds_filing_type, doc_type,
+           acceptance_date, COUNT(*) as chunks
+    FROM factset_vectors_do_not_edit_or_delete.vector.edg_metadata
+    WHERE company_name LIKE '%JPMORGAN%' OR company_name LIKE '%MICROSOFT%'
+    GROUP BY ALL
+    ORDER BY company_name, acceptance_date DESC
+""")
+
+print("JPM / MSFT filing detail in edg_metadata:")
+display(jpm_msft_detail)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ---
 # MAGIC ## Step 3 — Additional Capital-Markets Names (Not in Crosswalk)
 # MAGIC
@@ -285,23 +305,26 @@ else:
 # MAGIC ## Step 4 — Final 20 Recommendation
 # MAGIC
 # MAGIC **Priority:**
-# MAGIC 1. Crosswalk companies with strong document coverage (IN_POSITION_BOOK)
-# MAGIC 2. Fill with capital-markets names for breadth (RESEARCH_ONLY)
+# MAGIC 1. Crosswalk companies with filing coverage (IN_POSITION_BOOK) — **excluding zero-filing tickers**
+# MAGIC 2. Replace dropped tickers + fill remaining slots with top CM names by `filing_chunks` (RESEARCH_ONLY)
 
 # COMMAND ----------
 
 FINAL_N = 20
 
-# Rank crosswalk companies by total coverage (descending), exclude zero-coverage
+# --- Exclude crosswalk tickers that have 0 filing chunks ---
+EXCLUDE_ZERO_FILING = {"ROG-CH", "AZN-GB", "SAP-DE"}
+
 crosswalk_ranked = (
     crosswalk_coverage
     .where(F.col("total_chunks") > 0)
+    .where(~F.col("ticker_region").isin(EXCLUDE_ZERO_FILING))
     .withColumn("source", F.lit("IN_POSITION_BOOK"))
     .orderBy(F.desc("total_chunks"))
 )
 
 crosswalk_qualified = crosswalk_ranked.count()
-print(f"Crosswalk companies with any document coverage: {crosswalk_qualified}")
+print(f"Crosswalk companies kept (after excluding {EXCLUDE_ZERO_FILING}): {crosswalk_qualified}")
 
 # COMMAND ----------
 
@@ -310,13 +333,17 @@ if crosswalk_qualified >= FINAL_N:
     fill_count = 0
 else:
     fill_needed = FINAL_N - crosswalk_qualified
-    print(f"Need {fill_needed} additional companies from capital-markets list")
+    print(f"Need {fill_needed} CM replacements (3 for excluded tickers + any extra to reach {FINAL_N})")
 
     if cm_coverage is not None:
+        # Prioritise CM names with 500+ filing chunks, then by total_chunks
         cm_ranked = (
             cm_coverage
             .withColumn("source", F.lit("RESEARCH_ONLY"))
-            .orderBy(F.desc("total_chunks"))
+            .orderBy(
+                F.when(F.col("filing_chunks") >= 500, 0).otherwise(1),
+                F.desc("total_chunks"),
+            )
             .limit(fill_needed)
         )
         fill_count = min(cm_ranked.count(), fill_needed)
