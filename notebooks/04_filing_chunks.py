@@ -75,7 +75,7 @@ company_filter.createOrReplaceTempView("target_companies")
 
 filing_chunks_sql = """
     SELECT
-        edg.*,
+        edg.* EXCEPT(is_exhibit),
         docs.content AS chunk_text,
         tc.ticker,
         tc.ticker_region,
