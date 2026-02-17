@@ -246,11 +246,11 @@ display(by_date)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3.e — Compare to Expected (~2,925 news chunks)
+# MAGIC ### 3.e — Compare to Expected (~4,121 news chunks)
 
 # COMMAND ----------
 
-expected_chunks = 2925
+expected_chunks = 4121
 diff = chunk_count - expected_chunks
 pct = (diff / expected_chunks) * 100 if expected_chunks else 0
 print(f"Expected: ~{expected_chunks:,}")
