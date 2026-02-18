@@ -887,14 +887,23 @@ print(f"\n✓ All view and column comments applied across {len(view_comments)} v
 
 # COMMAND ----------
 
+import json
 from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 
-# Get existing Genie Space configuration
-space = w.genie.get_space(GENIE_SPACE_ID)
-print(f"Genie Space:     {space.title}")
-print(f"Current tables:  {space.table_identifiers}")
+# Get existing Genie Space configuration (must request serialized_space)
+space = w.genie.get_space(GENIE_SPACE_ID, include_serialized_space=True)
+space_config = json.loads(space.serialized_space) if space.serialized_space else {}
+
+print(f"Genie Space:  {space.title}")
+
+# Extract existing table identifiers from serialized_space
+existing_tables = space_config.get("data_sources", {}).get("tables", [])
+existing_ids = {t["identifier"] for t in existing_tables}
+print(f"Current tables: {len(existing_ids)}")
+for t in existing_tables:
+    print(f"  - {t['identifier']}")
 
 # COMMAND ----------
 
@@ -909,21 +918,27 @@ metric_views = [
     f"{METRICS_SCHEMA}.mv_research_coverage",
 ]
 
-# Combine existing tables with new metric views (dedup)
-existing_tables = list(space.table_identifiers or [])
-existing_set = set(existing_tables)
-new_views = [v for v in metric_views if v not in existing_set]
-all_tables = existing_tables + new_views
+# Add new metric views to the data_sources.tables list (dedup)
+new_views = [v for v in metric_views if v not in existing_ids]
+for v in new_views:
+    existing_tables.append({"identifier": v})
 
-print(f"Existing tables: {len(existing_tables)}")
-print(f"New views:       {len(new_views)}")
-print(f"Total:           {len(all_tables)}")
+# Sort tables by identifier (Genie API validation requires sorted arrays)
+existing_tables.sort(key=lambda t: t["identifier"])
 
-# Update the Genie Space with all tables
+# Ensure data_sources structure exists
+if "data_sources" not in space_config:
+    space_config["data_sources"] = {}
+space_config["data_sources"]["tables"] = existing_tables
+
+print(f"New views:    {len(new_views)}")
+print(f"Total tables: {len(existing_tables)}")
+
+# Update the Genie Space with modified serialized_space
 try:
     w.genie.update_space(
         space_id=GENIE_SPACE_ID,
-        table_identifiers=all_tables,
+        serialized_space=json.dumps(space_config),
     )
     print(f"\n✓ Registered {len(new_views)} metric views with Genie Space via SDK")
 except Exception as sdk_err:
@@ -938,7 +953,7 @@ except Exception as sdk_err:
     response = requests.patch(
         f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}",
         headers={"Authorization": f"Bearer {token}"},
-        json={"table_identifiers": all_tables},
+        json={"serialized_space": json.dumps(space_config)},
     )
 
     if response.status_code == 200:
@@ -980,24 +995,30 @@ sample_questions = [
     "What is the breakdown of filing types across our portfolio?",
 ]
 
-# Attempt to add sample questions via SDK or REST API
+# Add sample questions to Genie Space via serialized_space config
+import uuid
+
 try:
-    host = w.config.host.rstrip("/")
-    token = w.config.token
+    space = w.genie.get_space(GENIE_SPACE_ID, include_serialized_space=True)
+    space_config = json.loads(space.serialized_space) if space.serialized_space else {}
 
-    import requests
+    # Build sample_questions in the expected format: list of {id, question: [str]}
+    if "config" not in space_config:
+        space_config["config"] = {}
 
-    response = requests.patch(
-        f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"sample_questions": sample_questions},
+    sq_entries = []
+    for q in sample_questions:
+        sq_entries.append({
+            "id": uuid.uuid4().hex,
+            "question": [q],
+        })
+    space_config["config"]["sample_questions"] = sq_entries
+
+    w.genie.update_space(
+        space_id=GENIE_SPACE_ID,
+        serialized_space=json.dumps(space_config),
     )
-
-    if response.status_code == 200:
-        print(f"✓ Registered {len(sample_questions)} sample questions with Genie Space")
-    else:
-        print(f"REST API returned {response.status_code}: {response.text}")
-        print("Sample questions may need to be added manually in the Genie Space UI.")
+    print(f"✓ Registered {len(sample_questions)} sample questions with Genie Space")
 except Exception as e:
     print(f"Could not register sample questions programmatically: {e}")
     print("Add these manually in the Genie Space UI under 'Sample Questions':")
@@ -1183,13 +1204,17 @@ print(f"  Total flagged:        {total_flagged:>5} / {total_positions} positions
 # COMMAND ----------
 
 # Reload Genie Space config to verify
-space_check = w.genie.get_space(GENIE_SPACE_ID)
+space_check = w.genie.get_space(GENIE_SPACE_ID, include_serialized_space=True)
+check_config = json.loads(space_check.serialized_space) if space_check.serialized_space else {}
+check_tables = check_config.get("data_sources", {}).get("tables", [])
+
 print(f"Genie Space: {space_check.title}")
 print(f"Space ID:    {GENIE_SPACE_ID}")
-print(f"\nRegistered tables ({len(space_check.table_identifiers or [])}):")
-for t in (space_check.table_identifiers or []):
-    marker = " ← metric view" if ".metrics." in t else ""
-    print(f"  - {t}{marker}")
+print(f"\nRegistered tables ({len(check_tables)}):")
+for t in check_tables:
+    ident = t["identifier"]
+    marker = " ← metric view" if ".metrics." in ident else ""
+    print(f"  - {ident}{marker}")
 
 # COMMAND ----------
 
