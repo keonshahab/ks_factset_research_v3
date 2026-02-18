@@ -69,12 +69,23 @@ class _DictRow:
 class _PendingQuery:
     """Mimics the object returned by `spark.sql(query)` — supports `.collect()`."""
 
-    def __init__(self, cursor, sql):
+    def __init__(self, cursor, sql, *, proxy_host="", proxy_warehouse_id=""):
         self._cursor = cursor
         self._sql = sql
+        self._proxy_host = proxy_host
+        self._proxy_warehouse_id = proxy_warehouse_id
 
     def collect(self):
-        self._cursor.execute(self._sql)
+        try:
+            self._cursor.execute(self._sql)
+        except Exception as e:
+            raise RuntimeError(
+                f"SQL warehouse query failed. "
+                f"host={self._proxy_host!r}, "
+                f"warehouse_id={self._proxy_warehouse_id!r}, "
+                f"sql={self._sql[:200]!r}, "
+                f"error={e}"
+            ) from e
         columns = [desc[0] for desc in self._cursor.description]
         return [_DictRow(dict(zip(columns, row))) for row in self._cursor.fetchall()]
 
@@ -89,19 +100,31 @@ class _SQLWarehouseProxy:
     """
 
     def __init__(self, warehouse_id: str):
+        import logging
+
         from databricks import sql as dbsql
         from databricks.sdk.core import Config
+
+        logger = logging.getLogger("_SQLWarehouseProxy")
 
         # Use the SDK auth chain — it automatically resolves credentials
         # in Model Serving, notebooks, and local dev environments.
         cfg = Config()
 
-        host = (cfg.host or "").removeprefix("https://").removeprefix("http://")
-        if not host:
+        self._host = (
+            (cfg.host or "")
+            .removeprefix("https://")
+            .removeprefix("http://")
+            .rstrip("/")
+        )
+        if not self._host:
             raise RuntimeError(
                 "_SQLWarehouseProxy: Databricks host not found. "
                 f"DATABRICKS_HOST env var = {os.environ.get('DATABRICKS_HOST', '<not set>')!r}"
             )
+
+        self._warehouse_id = warehouse_id
+        self._http_path = f"/sql/1.0/warehouses/{warehouse_id}"
 
         # Extract Bearer token from SDK auth headers
         headers = cfg.authenticate()
@@ -113,16 +136,43 @@ class _SQLWarehouseProxy:
                 f"DATABRICKS_TOKEN env var set = {bool(os.environ.get('DATABRICKS_TOKEN'))}"
             )
 
+        logger.info(
+            "_SQLWarehouseProxy: connecting to host=%r, http_path=%r, auth_type=%s, token_len=%d",
+            self._host,
+            self._http_path,
+            cfg.auth_type,
+            len(token),
+        )
+
         self._connection = dbsql.connect(
-            server_hostname=host,
-            http_path=f"/sql/1.0/warehouses/{warehouse_id}",
+            server_hostname=self._host,
+            http_path=self._http_path,
             access_token=token,
         )
+
+        # Verify connectivity — fail fast with a clear message rather than
+        # returning a generic "Error during request to server" later.
+        try:
+            cur = self._connection.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchall()
+            cur.close()
+            logger.info("_SQLWarehouseProxy: connection test passed")
+        except Exception as e:
+            raise RuntimeError(
+                f"_SQLWarehouseProxy: connection test (SELECT 1) failed. "
+                f"host={self._host!r}, http_path={self._http_path!r}, "
+                f"auth_type={cfg.auth_type}, error={e}"
+            ) from e
 
     def sql(self, query):
         """Return a _PendingQuery whose .collect() executes the SQL."""
         cursor = self._connection.cursor()
-        return _PendingQuery(cursor, query)
+        return _PendingQuery(
+            cursor, query,
+            proxy_host=self._host,
+            proxy_warehouse_id=self._warehouse_id,
+        )
 
 
 # ---------------------------------------------------------------------------
