@@ -285,7 +285,7 @@ resources = [
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.filing_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.earnings_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.news_search_index"),
-    DatabricksSQLWarehouse(warehouse_id="aee7b8e863c14856"),  # for financial & position queries
+    DatabricksSQLWarehouse(warehouse_id="4b9b953939869799"),  # for financial & position queries
 ]
 
 print(f"Logging model to: {REGISTERED_MODEL_NAME}")
