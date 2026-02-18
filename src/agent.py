@@ -90,15 +90,28 @@ class _SQLWarehouseProxy:
 
     def __init__(self, warehouse_id: str):
         from databricks import sql as dbsql
+        from databricks.sdk.core import Config
 
-        host = os.environ.get("DATABRICKS_HOST", "")
-        # Strip protocol prefix — sql.connect wants bare hostname
-        if host.startswith("https://"):
-            host = host[len("https://"):]
-        elif host.startswith("http://"):
-            host = host[len("http://"):]
+        # Use the SDK auth chain — it automatically resolves credentials
+        # in Model Serving, notebooks, and local dev environments.
+        cfg = Config()
 
-        token = os.environ.get("DATABRICKS_TOKEN", "")
+        host = (cfg.host or "").removeprefix("https://").removeprefix("http://")
+        if not host:
+            raise RuntimeError(
+                "_SQLWarehouseProxy: Databricks host not found. "
+                f"DATABRICKS_HOST env var = {os.environ.get('DATABRICKS_HOST', '<not set>')!r}"
+            )
+
+        # Extract Bearer token from SDK auth headers
+        headers = cfg.authenticate()
+        token = headers.get("Authorization", "").removeprefix("Bearer ")
+        if not token:
+            raise RuntimeError(
+                "_SQLWarehouseProxy: No auth token found via SDK Config. "
+                f"Auth type = {cfg.auth_type}, "
+                f"DATABRICKS_TOKEN env var set = {bool(os.environ.get('DATABRICKS_TOKEN'))}"
+            )
 
         self._connection = dbsql.connect(
             server_hostname=host,
