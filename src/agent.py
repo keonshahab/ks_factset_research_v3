@@ -86,24 +86,28 @@ class _SQLWarehouseProxy:
     Provides the same ``proxy.sql(query).collect()`` →
     ``[row.asDict() for row in rows]`` interface used by financial_tools
     and position_tools.
+
+    Authentication uses the Databricks SDK credential provider chain, which
+    automatically handles PAT tokens, OAuth M2M, and managed identity —
+    whichever is available in the runtime environment.
     """
 
     def __init__(self, warehouse_id: str):
         from databricks import sql as dbsql
+        from databricks.sdk.core import Config
 
-        host = os.environ.get("DATABRICKS_HOST", "")
-        # Strip protocol prefix if present
+        cfg = Config()
+        host = cfg.host or ""
+        # Strip protocol prefix — sql.connect wants bare hostname
         if host.startswith("https://"):
             host = host[len("https://"):]
         elif host.startswith("http://"):
             host = host[len("http://"):]
 
-        token = os.environ.get("DATABRICKS_TOKEN", "")
-
         self._connection = dbsql.connect(
             server_hostname=host,
             http_path=f"/sql/1.0/warehouses/{warehouse_id}",
-            access_token=token,
+            credentials_provider=cfg.authenticate,
         )
 
     def sql(self, query):
