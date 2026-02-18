@@ -150,17 +150,22 @@ class _SQLWarehouseProxy:
             access_token=token,
         )
 
-        # Verify connectivity — fail fast with a clear message rather than
-        # returning a generic "Error during request to server" later.
+        # Verify connectivity and log the actual identity so we know
+        # exactly who to grant UC permissions to.
         try:
             cur = self._connection.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchall()
+            cur.execute("SELECT current_user() AS current_user, session_user() AS session_user")
+            row = cur.fetchone()
             cur.close()
-            logger.info("_SQLWarehouseProxy: connection test passed")
+            logger.warning(
+                "_SQLWarehouseProxy: connection test passed. "
+                "current_user=%s, session_user=%s",
+                row[0] if row else "UNKNOWN",
+                row[1] if row and len(row) > 1 else "UNKNOWN",
+            )
         except Exception as e:
             raise RuntimeError(
-                f"_SQLWarehouseProxy: connection test (SELECT 1) failed. "
+                f"_SQLWarehouseProxy: connection test failed. "
                 f"host={self._host!r}, http_path={self._http_path!r}, "
                 f"auth_type={cfg.auth_type}, error={e}"
             ) from e
