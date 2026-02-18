@@ -190,7 +190,7 @@ earnings_stats AS (
     SELECT
         ticker,
         COUNT(*)  AS earnings_count,
-        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(transcript_quarter AS INT) * 3, 1))) AS latest_earnings_date
+        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(REPLACE(transcript_quarter, 'Q', '') AS INT) * 3, 1))) AS latest_earnings_date
     FROM {DEMO_SCHEMA}.earnings_documents
     GROUP BY ticker
 ),
@@ -585,7 +585,7 @@ earnings_stats AS (
     SELECT
         ticker,
         COUNT(*) AS earnings_count,
-        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(transcript_quarter AS INT) * 3, 1))) AS latest_earnings_date
+        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(REPLACE(transcript_quarter, 'Q', '') AS INT) * 3, 1))) AS latest_earnings_date
     FROM {DEMO_SCHEMA}.earnings_documents
     GROUP BY ticker
 ),
