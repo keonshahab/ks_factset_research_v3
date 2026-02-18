@@ -308,7 +308,7 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
             "databricks-vectorsearch",
             "databricks-agents",
             "mlflow>=2.14",
-            "pyspark",
+            "databricks-sql-connector",
         ],
         resources=resources,
     )

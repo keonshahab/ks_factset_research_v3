@@ -16,6 +16,7 @@ model is fully self-contained and does not depend on notebook globals.
 from __future__ import annotations
 
 import json
+import os
 
 import mlflow
 import mlflow.pyfunc
@@ -48,6 +49,67 @@ from src.position_tools import (
 
 LLM_ENDPOINT = "databricks-claude-opus-4-6"   # system.ai.databricks-claude-opus-4-6
 MAX_TOOL_ROUNDS = 8
+WAREHOUSE_ID = "4b9b953939869799"
+
+
+# ---------------------------------------------------------------------------
+# SQL Warehouse Proxy (for Model Serving — no Spark / JVM available)
+# ---------------------------------------------------------------------------
+
+class _DictRow:
+    """Mimics a PySpark Row with `.asDict()` support."""
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def asDict(self):
+        return dict(self._data)
+
+
+class _PendingQuery:
+    """Mimics the object returned by `spark.sql(query)` — supports `.collect()`."""
+
+    def __init__(self, cursor, sql):
+        self._cursor = cursor
+        self._sql = sql
+
+    def collect(self):
+        self._cursor.execute(self._sql)
+        columns = [desc[0] for desc in self._cursor.description]
+        return [_DictRow(dict(zip(columns, row))) for row in self._cursor.fetchall()]
+
+
+class _SQLWarehouseProxy:
+    """Drop-in replacement for SparkSession that routes SQL through a
+    Databricks SQL warehouse via ``databricks-sql-connector``.
+
+    Provides the same ``proxy.sql(query).collect()`` →
+    ``[row.asDict() for row in rows]`` interface used by financial_tools
+    and position_tools.
+    """
+
+    def __init__(self, warehouse_id: str):
+        from databricks import sql as dbsql
+
+        host = os.environ.get("DATABRICKS_HOST", "")
+        # Strip protocol prefix if present
+        if host.startswith("https://"):
+            host = host[len("https://"):]
+        elif host.startswith("http://"):
+            host = host[len("http://"):]
+
+        token = os.environ.get("DATABRICKS_TOKEN", "")
+
+        self._connection = dbsql.connect(
+            server_hostname=host,
+            http_path=f"/sql/1.0/warehouses/{warehouse_id}",
+            access_token=token,
+        )
+
+    def sql(self, query):
+        """Return a _PendingQuery whose .collect() executes the SQL."""
+        cursor = self._connection.cursor()
+        return _PendingQuery(cursor, query)
 
 
 # ---------------------------------------------------------------------------
@@ -640,12 +702,23 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
     """
 
     def load_context(self, context):
-        """Initialize LLM client, citation engine, and Spark session."""
-        from pyspark.sql import SparkSession
+        """Initialize LLM client, citation engine, and SQL backend.
 
+        In a Databricks notebook the active SparkSession is used.  In Model
+        Serving (no JVM) we fall back to a lightweight SQL warehouse proxy
+        that uses ``databricks-sql-connector`` over HTTP.
+        """
         self.client = get_deploy_client("databricks")
         self.engine = CitationEngine()
-        self.spark = SparkSession.builder.getOrCreate()
+
+        # Try SparkSession first (works in notebook / cluster context)
+        try:
+            from pyspark.sql import SparkSession
+
+            self.spark = SparkSession.builder.getOrCreate()
+        except Exception:
+            # Model Serving: no JVM — use SQL warehouse proxy instead
+            self.spark = _SQLWarehouseProxy(WAREHOUSE_ID)
 
     @mlflow.trace(name="research_agent")
     def predict(self, context, messages, params=None):
