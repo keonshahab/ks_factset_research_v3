@@ -869,7 +869,7 @@ for view_name, columns in view_comments.items():
 
     # Comment on each column
     for col_name, col_desc in columns.items():
-        spark.sql(f"ALTER VIEW {fqn} ALTER COLUMN `{col_name}` COMMENT '{_esc(col_desc)}'")
+        spark.sql(f"COMMENT ON COLUMN {fqn}.`{col_name}` IS '{_esc(col_desc)}'")
 
     col_count = len(columns)
     print(f"✓ {view_name}: view comment + {col_count} column comments applied")
