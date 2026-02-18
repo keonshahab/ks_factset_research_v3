@@ -724,13 +724,21 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
         self.client = get_deploy_client("databricks")
         self.engine = CitationEngine()
 
-        # Try SparkSession first (works in notebook / cluster context)
+        # Use the active SparkSession if running on a Databricks cluster
+        # (notebook context).  In Model Serving there is no pre-existing
+        # Spark session, so getActiveSession() returns None and we fall
+        # back to a lightweight SQL warehouse proxy over HTTP.
+        # NOTE: Do NOT use getOrCreate() — in Model Serving it can create
+        # a local Spark session (if pyspark is installed) that cannot
+        # access Unity Catalog tables.
         try:
             from pyspark.sql import SparkSession
 
-            self.spark = SparkSession.builder.getOrCreate()
+            spark = SparkSession.getActiveSession()
+            if spark is None:
+                raise RuntimeError("No active Spark session")
+            self.spark = spark
         except Exception:
-            # Model Serving: no JVM — use SQL warehouse proxy instead
             self.spark = _SQLWarehouseProxy(WAREHOUSE_ID)
 
     @mlflow.trace(name="research_agent")
