@@ -272,8 +272,27 @@ print("All local agent tests passed.\n")
 
 mlflow.set_registry_uri("databricks-uc")
 
+# Databricks resource dependencies — required so Model Serving can authenticate
+# to the LLM endpoint, vector search indexes, and SQL warehouse.
+from mlflow.models.resources import (
+    DatabricksServingEndpoint,
+    DatabricksVectorSearchIndex,
+    DatabricksSQLWarehouse,
+)
+
+resources = [
+    DatabricksServingEndpoint(endpoint_name="databricks-claude-opus-4-6"),
+    DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.filing_search_index"),
+    DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.earnings_search_index"),
+    DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.news_search_index"),
+    DatabricksSQLWarehouse(warehouse_id="4b9b953939869799"),  # for financial & position queries
+]
+
 print(f"Logging model to: {REGISTERED_MODEL_NAME}")
 print(f"Agent module:     {AGENT_MODULE_PATH}")
+print(f"Resources:        {len(resources)} Databricks dependencies")
+for r in resources:
+    print(f"  • {r}")
 
 # COMMAND ----------
 
@@ -291,6 +310,7 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
             "mlflow>=2.14",
             "pyspark",
         ],
+        resources=resources,
     )
 
     # Tag the run with metadata
