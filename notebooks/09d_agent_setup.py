@@ -309,6 +309,7 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
             "databricks-agents",
             "mlflow>=2.14",
             "databricks-sql-connector",
+            "databricks-sdk",
         ],
         resources=resources,
     )
