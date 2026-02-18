@@ -5,7 +5,11 @@ Two-panel dark-themed layout:
 
   LEFT  (~30 %) — company selector, position badge, document library, upload
   RIGHT (~70 %) — chat input, agent responses with structured sections,
-                   citation panel, related-question chips, conversation history
+                   citation panel, related-question chips, conversation history,
+                   export (Copy / PDF)
+
+On load the app pre-selects **NVDA** and shows a sample Q&A exchange so the
+user immediately sees a fully-rendered response.
 
 Agent endpoint : ks_factset_research_v3_agent  (MLflow model serving)
 Data           : Databricks SQL  (ks_factset_research_v3 catalog)
@@ -16,8 +20,10 @@ Env vars required:
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
+import tempfile
 from html import escape
 from typing import Any
 
@@ -43,6 +49,8 @@ AGENT_URL = (
 )
 AGENT_TIMEOUT = 120  # seconds
 
+DEFAULT_TICKER = "NVDA"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Example queries  (7 chips)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -56,6 +64,73 @@ EXAMPLE_QUERIES = [
     "Show all active risk flags on our NVDA positions",
     "How did INTC's actual EPS compare to consensus estimates?",
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sample Q&A  (pre-populated for NVDA on first load)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SAMPLE_QUERY = "What are the key risk factors in NVDA's latest 10-K?"
+
+SAMPLE_RESPONSE = """\
+## Summary
+
+NVIDIA's 2024 10-K identifies supply chain concentration, geopolitical export \
+controls, and rapid technology obsolescence as its top risk factors. The \
+company's heavy reliance on TSMC for advanced chip fabrication and increasing \
+US-China trade restrictions present material threats to revenue growth [1] [2].
+
+## Analysis
+
+**Supply Chain Concentration:** NVIDIA depends on TSMC for 100% of its \
+leading-edge GPU production (5nm and below). Any disruption could materially \
+impact revenue, as alternative foundry capacity at comparable nodes is \
+extremely limited [1].
+
+**Export Controls:** The US Bureau of Industry and Security expanded \
+restrictions on AI chip exports to China in October 2023. NVIDIA disclosed \
+that **$5.0B** in annual Data Center revenue (approximately **18.5%** of \
+total $27.0B) is at risk from current and potential future export \
+controls [1] [2].
+
+**Technology Obsolescence:** The AI accelerator market is intensifying with \
+competition from AMD MI300X, Intel Gaudi, Google TPU v5, and custom ASICs \
+from hyperscalers. NVIDIA must maintain its CUDA software moat and \
+generational performance leadership to sustain its >80% market share [2].
+
+**Customer Concentration:** The top 5 customers (Microsoft, Meta, Amazon, \
+Google, Oracle) account for approximately **46%** of Data Center \
+revenue [1].
+
+## Position Context
+
+NVIDIA is in our position book. **Total notional: $320.0M** across 6 \
+positions on 4 desks. Largest exposure is Equity Trading ($175.0M notional, \
+Momentum + Index Arb strategies). Equity Derivatives holds $45.0M in options \
+(net long vol). **1 active risk flag:** concentration flag due to >$250M \
+single-name exposure.
+
+## Calculations
+
+- Export control revenue at risk: $5.0B / $27.0B total = **18.5%** of revenue
+- Customer concentration (top 5): ~46% of Data Center revenue
+- Position concentration: $320.0M total notional = flagged
+
+## Sources
+
+- [1] NVDA 10-K 2024 -- Item 1A Risk Factors (filed Feb 2024)
+- [2] NVDA 10-K 2024 -- Business Overview, Competition section
+- [3] NVDA Earnings Q4 2024 -- Management commentary on China exposure
+
+## Confidence
+
+HIGH
+
+## Related Questions
+
+- How do NVIDIA's leverage ratios compare to AMD and Intel?
+- What is the P&L trend on our NVDA Equity Derivatives positions?
+- Has NVIDIA's consensus EPS estimate been revised since the latest export control announcement?
+"""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Database helpers
@@ -411,7 +486,7 @@ _CITE_COLORS: dict[str, str] = {
 
 
 def _md_to_html(text: str) -> str:
-    """Minimal markdown \u2192 HTML (bold, italic, code, lists, paragraphs)."""
+    """Minimal markdown -> HTML (bold, italic, code, lists, paragraphs)."""
     text = escape(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", text)
@@ -424,9 +499,10 @@ def _md_to_html(text: str) -> str:
         if not blk:
             continue
         lines = blk.split("\n")
+        _bullet_re = re.compile(r'^[-*0-9.]+\s*')
         if all(re.match(r"^[\-\*\d.]+\s", ln.strip()) for ln in lines if ln.strip()):
             items = "".join(
-                f"<li>{re.sub(r'^[-*0-9.]+s*', '', ln.strip())}</li>"
+                "<li>" + _bullet_re.sub("", ln.strip()) + "</li>"
                 for ln in lines if ln.strip()
             )
             out.append(f"<ul>{items}</ul>")
@@ -571,20 +647,84 @@ def render_conversation(history: list[dict]) -> str:
 
     return f'<div class="conv-wrap">{"".join(parts)}</div>'
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PDF export
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _loading_html(history: list[dict]) -> str:
-    """Conversation HTML with a loading indicator appended."""
-    base = render_conversation(history)
-    loader = (
-        '<div class="conv-row conv-asst">'
-        '<div class="bubble bub-asst bub-loading">'
-        '<span class="ld-dots"><span>.</span><span>.</span><span>.</span></span>'
-        " Analyzing with 14 research tools\u2026"
-        "</div></div>"
+def _sanitize_latin1(text: str) -> str:
+    """Replace common Unicode chars for Latin-1 PDF compatibility."""
+    subs = {
+        "\u2014": "--", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u2691": "[!]",
+        "\u25b6": ">", "\u25bc": "v", "\u2192": "->",
+    }
+    for k, v in subs.items():
+        text = text.replace(k, v)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def generate_pdf(history: list[dict], ticker: str | None) -> str | None:
+    """Create a PDF report from conversation history. Returns file path."""
+    try:
+        from fpdf import FPDF  # fpdf2
+    except ImportError:
+        return None
+
+    if not history:
+        return None
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # --- title ---
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Research & Deal Intelligence Report", ln=True)
+    if ticker:
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, _sanitize_latin1(f"Company: {ticker}"), ln=True)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(128, 128, 128)
+    pdf.cell(
+        0, 6,
+        f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ln=True,
     )
-    if "<div class=\"conv-wrap\">" in base:
-        return base.replace("</div>\n", f"{loader}</div>", 1).rstrip() or base[:-6] + loader + "</div>"
-    return base + loader
+    pdf.ln(5)
+    pdf.set_text_color(0, 0, 0)
+
+    # --- conversation ---
+    for msg in history:
+        if msg["role"] == "user":
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(0, 80, 160)
+            pdf.cell(0, 7, "Question:", ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(0, 0, 0)
+            pdf.multi_cell(0, 5, _sanitize_latin1(msg["content"]))
+            pdf.ln(3)
+
+        elif msg["role"] == "assistant":
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(60, 60, 60)
+            pdf.cell(0, 7, "Analysis:", ln=True)
+            sections = _parse_sections(msg["content"])
+            for sec_name in _SECTION_NAMES:
+                key = sec_name.title()
+                if key not in sections:
+                    continue
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.set_text_color(80, 80, 80)
+                pdf.cell(0, 6, _sanitize_latin1(sec_name), ln=True)
+                pdf.set_font("Helvetica", "", 9)
+                pdf.set_text_color(30, 30, 30)
+                pdf.multi_cell(0, 5, _sanitize_latin1(sections[key]))
+                pdf.ln(2)
+            pdf.ln(5)
+
+    path = os.path.join(tempfile.gettempdir(), "research_report.pdf")
+    pdf.output(path)
+    return path
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CSS
@@ -621,12 +761,14 @@ DARK_CSS = """
     background:#e94560; color:#fff; padding:2px 8px;
     border-radius:4px; font-size:.8rem; font-weight:600;
 }
-.tab-nav button { font-size:.85rem !important; }
 .upload-hint { text-align:center; font-size:.75rem; color:#5a6a7a; margin-top:2px; }
 
 /* ================================================================ */
-/*  RIGHT PANEL — conversation                                      */
+/*  RIGHT PANEL                                                     */
 /* ================================================================ */
+.right-panel { border-left:1px solid #1f2937; padding-left:12px !important; }
+
+/* -- conversation ------------------------------------------------ */
 .conv-scroll {
     max-height: 520px; overflow-y: auto;
     padding: 8px 4px; scroll-behavior: smooth;
@@ -670,9 +812,7 @@ DARK_CSS = """
     40% { opacity:1; }
 }
 
-/* ================================================================ */
-/*  RIGHT PANEL — response sections                                 */
-/* ================================================================ */
+/* -- response sections ------------------------------------------- */
 .resp-sec {
     margin:10px 0; padding:10px 14px; border-radius:8px;
     border:1px solid #252547;
@@ -697,9 +837,7 @@ DARK_CSS = """
 .sec-body li { margin:2px 0; }
 .resp-pre { margin-bottom:6px; }
 
-/* ================================================================ */
-/*  RIGHT PANEL — citations                                         */
-/* ================================================================ */
+/* -- citations --------------------------------------------------- */
 .cite-badge {
     display:inline-block; color:#fff; font-size:.72rem; font-weight:700;
     padding:1px 6px; border-radius:3px; vertical-align:middle;
@@ -719,9 +857,7 @@ DARK_CSS = """
     padding:1px 6px; border-radius:3px; margin-right:4px;
 }
 
-/* ================================================================ */
-/*  RIGHT PANEL — confidence badge                                  */
-/* ================================================================ */
+/* -- confidence badge -------------------------------------------- */
 .confidence-row {
     font-size:.8rem; color:#7b8794; margin-bottom:6px;
     display:flex; align-items:center; gap:6px;
@@ -734,9 +870,7 @@ DARK_CSS = """
 .conf-medium { background:#b08a28; }
 .conf-low    { background:#c0392b; }
 
-/* ================================================================ */
-/*  RIGHT PANEL — example & related-question chips                  */
-/* ================================================================ */
+/* -- chips ------------------------------------------------------- */
 .example-chip-row { margin-bottom:4px !important; }
 .example-chip-row button,
 .rq-chip-row button {
@@ -751,10 +885,22 @@ DARK_CSS = """
 .rq-label {
     font-size:.8rem; color:#7b8794; margin-bottom:2px; display:block;
 }
+
+/* -- export bar -------------------------------------------------- */
+.export-bar { margin-top:4px !important; }
+.export-bar button {
+    font-size:.78rem !important;
+    min-width:70px !important;
+}
+.copy-toast {
+    font-size:.75rem; color:#50c878; display:inline-block;
+    margin-left:6px; opacity:0; transition:opacity .3s;
+}
+.copy-toast.show { opacity:1; }
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
-# JS  (dark mode + auto-scroll conversation)
+# JS  (dark mode + auto-scroll + clipboard helper)
 # ═══════════════════════════════════════════════════════════════════════════
 
 DARK_JS = """
@@ -772,6 +918,26 @@ DARK_JS = """
 }
 """
 
+COPY_JS = """
+(history) => {
+    if (!history || !history.length) return;
+    const lines = history
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => (m.role === 'user' ? 'Q: ' : 'A: ') + m.content);
+    const text = lines.join('\\n\\n');
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(text);
+    } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+    }
+}
+"""
+
 # ═══════════════════════════════════════════════════════════════════════════
 # App factory
 # ═══════════════════════════════════════════════════════════════════════════
@@ -779,7 +945,7 @@ DARK_JS = """
 def create_app() -> gr.Blocks:
     """Build and return the Gradio Blocks application."""
 
-    # pre-load companies (graceful fallback)
+    # ── pre-load companies ────────────────────────────────────────────
     try:
         company_data = load_companies()
     except Exception:
@@ -790,6 +956,49 @@ def create_app() -> gr.Blocks:
         label: ticker for label, ticker in company_data
     }
 
+    # ── find default ticker (NVDA) ────────────────────────────────────
+    default_label: str | None = None
+    default_ticker: str | None = None
+    for label, ticker in company_data:
+        if ticker == DEFAULT_TICKER:
+            default_label = label
+            default_ticker = ticker
+            break
+
+    # ── pre-load left-panel data for default ticker ───────────────────
+    init_badge = _badge_empty()
+    init_f_choices: list[tuple[str, str]] = []
+    init_e_choices: list[tuple[str, str]] = []
+    init_n_choices: list[tuple[str, str]] = []
+
+    if default_ticker:
+        try:
+            init_badge = load_position_badge(default_ticker)
+            init_f_choices = [
+                (_filing_label(r), r["document_id"])
+                for r in load_filings(default_ticker)
+            ]
+            init_e_choices = [
+                (_earnings_label(r), r["document_id"])
+                for r in load_earnings(default_ticker)
+            ]
+            init_n_choices = [
+                (_news_label(r), r["document_id"])
+                for r in load_news(default_ticker)
+            ]
+        except Exception:
+            pass
+
+    # ── pre-build sample Q&A ──────────────────────────────────────────
+    sample_html, sample_cite, sample_rqs = render_agent_response(SAMPLE_RESPONSE)
+    init_history: list[dict] = [
+        {"role": "user", "content": SAMPLE_QUERY},
+        {"role": "assistant", "content": SAMPLE_RESPONSE, "html": sample_html},
+    ]
+    init_conv = render_conversation(init_history)
+
+    has_sample = True  # example chips hidden, rq chips shown
+
     with gr.Blocks(
         theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
         css=DARK_CSS,
@@ -798,9 +1007,9 @@ def create_app() -> gr.Blocks:
     ) as app:
 
         # ── shared state ──────────────────────────────────────────────
-        selected_ticker = gr.State(value=None)
+        selected_ticker = gr.State(value=default_ticker)
         selected_doc_ids = gr.State(value=[])
-        conv_history = gr.State(value=[])
+        conv_history = gr.State(value=init_history)
 
         with gr.Row():
             # ==========================================================
@@ -817,25 +1026,29 @@ def create_app() -> gr.Blocks:
 
                 company_dd = gr.Dropdown(
                     choices=company_labels,
+                    value=default_label,
                     label="Company",
                     info="Select a company to load documents",
                     filterable=True,
                 )
 
-                position_html = gr.HTML(value=_badge_empty())
+                position_html = gr.HTML(value=init_badge)
 
                 with gr.Tabs():
                     with gr.Tab("\U0001f4c1 Filings"):
                         filing_checks = gr.CheckboxGroup(
-                            choices=[], label="Select filings", value=[],
+                            choices=init_f_choices,
+                            label="Select filings", value=[],
                         )
                     with gr.Tab("\U0001f4ca Earnings"):
                         earnings_checks = gr.CheckboxGroup(
-                            choices=[], label="Select transcripts", value=[],
+                            choices=init_e_choices,
+                            label="Select transcripts", value=[],
                         )
                     with gr.Tab("\U0001f4f0 News"):
                         news_checks = gr.CheckboxGroup(
-                            choices=[], label="Select articles", value=[],
+                            choices=init_n_choices,
+                            label="Select articles", value=[],
                         )
 
                 gr.Markdown("---")
@@ -854,46 +1067,77 @@ def create_app() -> gr.Blocks:
             # ==========================================================
             # RIGHT PANEL  (~70 %)
             # ==========================================================
-            with gr.Column(scale=7, min_width=500):
+            with gr.Column(scale=7, min_width=500,
+                           elem_classes=["right-panel"]):
 
                 # -- conversation area ---------------------------------
                 conv_html = gr.HTML(
-                    value=render_conversation([]),
+                    value=init_conv,
                     elem_classes=["conv-scroll"],
                 )
 
+                # -- export bar ----------------------------------------
+                with gr.Row(elem_classes=["export-bar"]):
+                    copy_btn = gr.Button(
+                        "Copy", size="sm", variant="secondary",
+                        scale=0, min_width=70,
+                    )
+                    pdf_btn = gr.Button(
+                        "PDF", size="sm", variant="secondary",
+                        scale=0, min_width=70,
+                    )
+                    pdf_download = gr.File(
+                        visible=False, label="Download",
+                        scale=1,
+                    )
+
                 # -- citation panel ------------------------------------
-                cite_html = gr.HTML(value="")
+                cite_html = gr.HTML(value=sample_cite)
 
                 # -- related-question chips (up to 3) ------------------
-                rq_label = gr.HTML(
-                    value="", visible=False,
+                rq_label_html = gr.HTML(
+                    value='<span class="rq-label">Related questions:</span>',
+                    visible=has_sample and len(sample_rqs) > 0,
                 )
-                with gr.Row(visible=False, elem_classes=["rq-chip-row"]) as rq_row:
-                    rq_btn0 = gr.Button("", size="sm", variant="secondary",
-                                        visible=False)
-                    rq_btn1 = gr.Button("", size="sm", variant="secondary",
-                                        visible=False)
-                    rq_btn2 = gr.Button("", size="sm", variant="secondary",
-                                        visible=False)
+                with gr.Row(
+                    visible=has_sample and len(sample_rqs) > 0,
+                    elem_classes=["rq-chip-row"],
+                ) as rq_row:
+                    rq_btn0 = gr.Button(
+                        sample_rqs[0] if len(sample_rqs) > 0 else "",
+                        size="sm", variant="secondary",
+                        visible=len(sample_rqs) > 0,
+                    )
+                    rq_btn1 = gr.Button(
+                        sample_rqs[1] if len(sample_rqs) > 1 else "",
+                        size="sm", variant="secondary",
+                        visible=len(sample_rqs) > 1,
+                    )
+                    rq_btn2 = gr.Button(
+                        sample_rqs[2] if len(sample_rqs) > 2 else "",
+                        size="sm", variant="secondary",
+                        visible=len(sample_rqs) > 2,
+                    )
 
-                # -- example-query chips -------------------------------
+                # -- example-query chips (hidden when sample Q&A) ------
                 examples_hdr = gr.HTML(
                     '<div class="examples-hdr">Try an example:</div>',
-                    visible=True,
+                    visible=not has_sample,
                 )
-                with gr.Row(visible=True,
-                            elem_classes=["example-chip-row"]) as ex_row_a:
+                with gr.Row(
+                    visible=not has_sample,
+                    elem_classes=["example-chip-row"],
+                ) as ex_row_a:
                     ex_btns_a = [
-                        gr.Button(q, size="sm", variant="secondary",
-                                  elem_classes=["example-chip"])
+                        gr.Button(q, size="sm", variant="secondary")
                         for q in EXAMPLE_QUERIES[:4]
                     ]
-                with gr.Row(visible=True,
-                            elem_classes=["example-chip-row"]) as ex_row_b:
+                with gr.Row(
+                    visible=not has_sample,
+                    elem_classes=["example-chip-row"],
+                ) as ex_row_b:
                     ex_btns_b = [
-                        gr.Button(q, size="sm", variant="secondary",
-                                  elem_classes=["example-chip"])
+                        gr.Button(q, size="sm", variant="secondary")
                         for q in EXAMPLE_QUERIES[4:]
                     ]
 
@@ -916,59 +1160,55 @@ def create_app() -> gr.Blocks:
         # ==============================================================
 
         def on_company_select(choice: str | None):
+            # 17 outputs
             if not choice:
-                empty = (
-                    None,
-                    _badge_empty(),
-                    gr.update(choices=[], value=[]),
-                    gr.update(choices=[], value=[]),
-                    gr.update(choices=[], value=[]),
-                    [],
-                    [],                              # clear conversation
-                    render_conversation([]),
-                    "",                              # clear citations
-                    gr.update(visible=False),         # rq_label
-                    gr.update(visible=False),         # rq_row
-                    gr.update(visible=False),         # rq0
-                    gr.update(visible=False),         # rq1
-                    gr.update(visible=False),         # rq2
-                    gr.update(visible=True),          # examples_hdr
-                    gr.update(visible=True),          # ex_row_a
-                    gr.update(visible=True),          # ex_row_b
+                return (
+                    None,                                     # selected_ticker
+                    _badge_empty(),                           # position_html
+                    gr.update(choices=[], value=[]),           # filing_checks
+                    gr.update(choices=[], value=[]),           # earnings_checks
+                    gr.update(choices=[], value=[]),           # news_checks
+                    [],                                       # selected_doc_ids
+                    [],                                       # conv_history
+                    render_conversation([]),                   # conv_html
+                    "",                                       # cite_html
+                    gr.update(visible=False),                 # rq_label_html
+                    gr.update(visible=False),                 # rq_row
+                    gr.update(visible=False),                 # rq0
+                    gr.update(visible=False),                 # rq1
+                    gr.update(visible=False),                 # rq2
+                    gr.update(visible=True),                  # examples_hdr
+                    gr.update(visible=True),                  # ex_row_a
+                    gr.update(visible=True),                  # ex_row_b
                 )
-                return empty
 
             ticker = company_map.get(choice, "")
-
             badge = load_position_badge(ticker)
-
-            f_rows = load_filings(ticker)
-            f_ch = [(_filing_label(r), r["document_id"]) for r in f_rows]
-
-            e_rows = load_earnings(ticker)
-            e_ch = [(_earnings_label(r), r["document_id"]) for r in e_rows]
-
-            n_rows = load_news(ticker)
-            n_ch = [(_news_label(r), r["document_id"]) for r in n_rows]
+            f_ch = [(_filing_label(r), r["document_id"])
+                    for r in load_filings(ticker)]
+            e_ch = [(_earnings_label(r), r["document_id"])
+                    for r in load_earnings(ticker)]
+            n_ch = [(_news_label(r), r["document_id"])
+                    for r in load_news(ticker)]
 
             return (
-                ticker,
-                badge,
-                gr.update(choices=f_ch, value=[]),
-                gr.update(choices=e_ch, value=[]),
-                gr.update(choices=n_ch, value=[]),
-                [],
-                [],                              # clear conversation
-                render_conversation([]),
-                "",                              # clear citations
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
+                ticker,                                   # selected_ticker
+                badge,                                    # position_html
+                gr.update(choices=f_ch, value=[]),        # filing_checks
+                gr.update(choices=e_ch, value=[]),        # earnings_checks
+                gr.update(choices=n_ch, value=[]),        # news_checks
+                [],                                       # selected_doc_ids
+                [],                                       # conv_history
+                render_conversation([]),                   # conv_html
+                "",                                       # cite_html
+                gr.update(visible=False),                 # rq_label_html
+                gr.update(visible=False),                 # rq_row
+                gr.update(visible=False),                 # rq0
+                gr.update(visible=False),                 # rq1
+                gr.update(visible=False),                 # rq2
+                gr.update(visible=True),                  # examples_hdr
+                gr.update(visible=True),                  # ex_row_a
+                gr.update(visible=True),                  # ex_row_b
             )
 
         company_dd.change(
@@ -979,7 +1219,7 @@ def create_app() -> gr.Blocks:
                 filing_checks, earnings_checks, news_checks,
                 selected_doc_ids,
                 conv_history, conv_html, cite_html,
-                rq_label, rq_row, rq_btn0, rq_btn1, rq_btn2,
+                rq_label_html, rq_row, rq_btn0, rq_btn1, rq_btn2,
                 examples_hdr, ex_row_a, ex_row_b,
             ],
         )
@@ -998,10 +1238,9 @@ def create_app() -> gr.Blocks:
         # Event handlers — right panel (chat)
         # ==============================================================
 
-        # Shared output list (everything the send generator touches)
-        _send_outputs = [
+        _send_outputs = [                         # 12 items
             chat_input, conv_history, conv_html, cite_html,
-            rq_label, rq_row, rq_btn0, rq_btn1, rq_btn2,
+            rq_label_html, rq_row, rq_btn0, rq_btn1, rq_btn2,
             examples_hdr, ex_row_a, ex_row_b,
         ]
 
@@ -1014,6 +1253,7 @@ def create_app() -> gr.Blocks:
             """Generator: yield loading state, then final state."""
             text = (text or "").strip()
             if not text:
+                # 12 no-op outputs
                 yield (
                     "", history, render_conversation(history), "",
                     gr.update(), gr.update(), gr.update(),
@@ -1022,10 +1262,9 @@ def create_app() -> gr.Blocks:
                 )
                 return
 
-            # --- yield 1: loading -----------------------------------
+            # --- yield 1: loading ---
             history = history + [{"role": "user", "content": text}]
             loading_conv = render_conversation(history)
-            # append a loading bubble
             loader = (
                 '<div class="conv-row conv-asst">'
                 '<div class="bubble bub-asst bub-loading">'
@@ -1044,7 +1283,7 @@ def create_app() -> gr.Blocks:
                 history,                                  # conv_history
                 loading_conv,                             # conv_html
                 "",                                       # cite_html
-                gr.update(visible=False),                 # rq_label
+                gr.update(visible=False),                 # rq_label_html
                 gr.update(visible=False),                 # rq_row
                 gr.update(visible=False),                 # rq0
                 gr.update(visible=False),                 # rq1
@@ -1054,7 +1293,7 @@ def create_app() -> gr.Blocks:
                 gr.update(visible=False),                 # ex_row_b
             )
 
-            # --- call agent ----------------------------------------
+            # --- call agent ---
             agent_msgs = [
                 {"role": m["role"], "content": m["content"]}
                 for m in history
@@ -1062,7 +1301,7 @@ def create_app() -> gr.Blocks:
             ]
             result = call_agent(agent_msgs, ticker, doc_ids or None)
 
-            # --- yield 2: final ------------------------------------
+            # --- yield 2: final ---
             if result["error"]:
                 history = history + [
                     {"role": "error", "content": result["error"]}
@@ -1090,9 +1329,8 @@ def create_app() -> gr.Blocks:
                 {"role": "assistant", "content": content, "html": resp_html}
             ]
 
-            # related-question buttons
             rq_updates: list = []
-            for i, btn_ref in enumerate([rq_btn0, rq_btn1, rq_btn2]):
+            for i in range(3):
                 if i < len(related):
                     rq_updates.append(
                         gr.update(value=related[i], visible=True)
@@ -1107,7 +1345,7 @@ def create_app() -> gr.Blocks:
                 history,                                  # conv_history
                 render_conversation(history),             # conv_html
                 cit_html,                                 # cite_html
-                gr.update(                                # rq_label
+                gr.update(                                # rq_label_html
                     value='<span class="rq-label">Related questions:</span>',
                     visible=show_rq,
                 ),
@@ -1155,6 +1393,31 @@ def create_app() -> gr.Blocks:
                         selected_ticker, selected_doc_ids],
                 outputs=_send_outputs,
             )
+
+        # ==============================================================
+        # Event handlers — export
+        # ==============================================================
+
+        # Copy (JS-only, no server round-trip)
+        copy_btn.click(
+            fn=None,
+            inputs=[conv_history],
+            outputs=[],
+            js=COPY_JS,
+        )
+
+        # PDF
+        def _on_pdf(history, ticker):
+            path = generate_pdf(history, ticker)
+            if path and os.path.exists(path):
+                return gr.update(value=path, visible=True)
+            return gr.update(visible=False)
+
+        pdf_btn.click(
+            _on_pdf,
+            inputs=[conv_history, selected_ticker],
+            outputs=[pdf_download],
+        )
 
     return app
 
