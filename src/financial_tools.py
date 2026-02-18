@@ -73,12 +73,6 @@ def _pct(value: Optional[float]) -> str:
 
 def _query_financials(spark, sql: str) -> List[Dict[str, Any]]:
     """Run *sql* via Spark and return a list of row-dicts."""
-    # DEBUG: identify the serving endpoint's runtime identity
-    try:
-        _id = spark.sql("SELECT current_user() AS whoami").collect()
-        print(f"DEBUG_IDENTITY: {_id}")
-    except Exception as _e:
-        print(f"DEBUG_IDENTITY_ERROR: {_e}")
     rows = spark.sql(sql).collect()
     return [row.asDict() for row in rows]
 
