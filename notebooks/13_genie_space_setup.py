@@ -114,6 +114,15 @@ print(f"✓ Schema {METRICS_SCHEMA} ready")
 # MAGIC Executive view: one row per company in the portfolio, joining latest holdings exposure
 # MAGIC to company profile, latest LTM financials, risk flags, and research document coverage.
 # MAGIC This is THE primary view for the Genie Space.
+# MAGIC
+# MAGIC **Column mapping notes (from schema discovery):**
+# MAGIC - Holdings: `trading_desk` (not desk), `market_value_usd` (not market_value), `var_95_1d` (not var), `trader_name` (not trader)
+# MAGIC - Holdings has `ticker` and `sector_name` directly — no need for demo_companies or company_profile for these
+# MAGIC - Company profile has NO sector/industry columns — sector sourced from holdings `sector_name`
+# MAGIC - Company financials: `operating_income` (not ebitda), `eps` (not eps_diluted)
+# MAGIC - Risk monitor: `volcker_covered`, `restricted_list`, `material_non_public` (not volcker_flag, restricted_list_flag, mnpi_flag)
+# MAGIC - Risk monitor has `ticker` but NOT `ticker_region`
+# MAGIC - Earnings documents: `transcript_quarter` is STRING type — needs CAST for arithmetic
 
 # COMMAND ----------
 
@@ -128,23 +137,20 @@ WITH latest_date AS (
 holdings_agg AS (
     SELECT
         h.ticker_region,
-        SUM(h.notional_usd)          AS total_notional,
-        SUM(h.market_value)             AS total_market_value,
-        COUNT(*)                        AS position_count,
-        COUNT(DISTINCT h.desk)          AS desk_count,
-        CONCAT_WS(', ', COLLECT_SET(h.asset_class)) AS asset_class_list,
-        SUM(h.`var`)                    AS total_var,
-        SUM(h.dv01)                     AS total_dv01,
-        SUM(h.cs01)                     AS total_cs01
+        FIRST(h.ticker)                                     AS ticker,
+        FIRST(h.sector_name)                                AS sector,
+        SUM(h.notional_usd)                                 AS total_notional,
+        SUM(h.market_value_usd)                             AS total_market_value,
+        COUNT(*)                                            AS position_count,
+        COUNT(DISTINCT h.trading_desk)                      AS desk_count,
+        CONCAT_WS(', ', COLLECT_SET(h.asset_class))         AS asset_class_list,
+        SUM(h.var_95_1d)                                    AS total_var,
+        SUM(h.dv01)                                         AS total_dv01,
+        SUM(h.cs01)                                         AS total_cs01
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
     WHERE h.as_of_date = ld.max_date
     GROUP BY h.ticker_region
-),
-
-ticker_map AS (
-    SELECT ticker_region, ticker
-    FROM {GOLD_SCHEMA}.demo_companies
 ),
 
 ltm_financials AS (
@@ -159,15 +165,16 @@ ltm_financials AS (
     WHERE f.period_type = 'LTM'
 ),
 
+-- Risk monitor has ticker (not ticker_region), so aggregate by ticker
 compliance AS (
     SELECT
-        ticker_region,
-        MAX(CASE WHEN volcker_flag THEN 1 ELSE 0 END)        AS has_volcker,
-        MAX(CASE WHEN restricted_list_flag THEN 1 ELSE 0 END) AS has_restricted,
-        MAX(CASE WHEN mnpi_flag THEN 1 ELSE 0 END)           AS has_mnpi,
-        MAX(CASE WHEN concentration_flag THEN 1 ELSE 0 END)  AS has_concentration
+        ticker,
+        MAX(CASE WHEN volcker_covered THEN 1 ELSE 0 END)       AS has_volcker,
+        MAX(CASE WHEN restricted_list THEN 1 ELSE 0 END)       AS has_restricted,
+        MAX(CASE WHEN material_non_public THEN 1 ELSE 0 END)   AS has_mnpi,
+        MAX(CASE WHEN concentration_flag THEN 1 ELSE 0 END)    AS has_concentration
     FROM {RISK_TABLE}
-    GROUP BY ticker_region
+    GROUP BY ticker
 ),
 
 filing_stats AS (
@@ -183,7 +190,7 @@ earnings_stats AS (
     SELECT
         ticker,
         COUNT(*)  AS earnings_count,
-        MAX(LAST_DAY(MAKE_DATE(transcript_year, transcript_quarter * 3, 1))) AS latest_earnings_date
+        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(transcript_quarter AS INT) * 3, 1))) AS latest_earnings_date
     FROM {DEMO_SCHEMA}.earnings_documents
     GROUP BY ticker
 ),
@@ -198,22 +205,21 @@ news_stats AS (
 )
 
 SELECT
-    tm.ticker,
+    ha.ticker,
     ha.ticker_region,
     cp.company_name,
-    cp.sector,
-    cp.industry,
+    ha.sector,
     cp.country,
     ha.total_notional,
     ha.total_market_value,
     ha.position_count,
     ha.desk_count,
     ha.asset_class_list,
-    lf.revenue                                              AS ltm_revenue,
-    lf.ebitda                                               AS ltm_ebitda,
-    lf.net_income                                           AS ltm_net_income,
-    lf.eps_diluted                                          AS ltm_eps,
-    ROUND(lf.total_debt / NULLIF(lf.ebitda, 0), 2)         AS leverage_ratio,
+    lf.revenue                                                  AS ltm_revenue,
+    lf.operating_income                                         AS ltm_operating_income,
+    lf.net_income                                               AS ltm_net_income,
+    lf.eps                                                      AS ltm_eps,
+    ROUND(lf.total_debt / NULLIF(lf.operating_income, 0), 2)   AS leverage_ratio,
     ha.total_var,
     ha.total_dv01,
     ha.total_cs01,
@@ -221,21 +227,20 @@ SELECT
         WHEN COALESCE(c.has_volcker, 0) + COALESCE(c.has_restricted, 0)
            + COALESCE(c.has_mnpi, 0) + COALESCE(c.has_concentration, 0) > 0
         THEN TRUE ELSE FALSE
-    END                                                     AS has_compliance_flags,
-    COALESCE(fs.filing_count, 0)                            AS filing_count,
-    COALESCE(es.earnings_count, 0)                          AS earnings_count,
-    COALESCE(ns.news_count, 0)                              AS news_count,
+    END                                                         AS has_compliance_flags,
+    COALESCE(fs.filing_count, 0)                                AS filing_count,
+    COALESCE(es.earnings_count, 0)                              AS earnings_count,
+    COALESCE(ns.news_count, 0)                                  AS news_count,
     fs.latest_filing_date,
     es.latest_earnings_date,
     ns.latest_news_date
 FROM holdings_agg ha
-JOIN ticker_map tm             ON ha.ticker_region = tm.ticker_region
-LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON tm.ticker = cp.ticker
-LEFT JOIN ltm_financials lf    ON tm.ticker = lf.ticker
-LEFT JOIN compliance c         ON ha.ticker_region = c.ticker_region
-LEFT JOIN filing_stats fs      ON tm.ticker = fs.ticker
-LEFT JOIN earnings_stats es    ON tm.ticker = es.ticker
-LEFT JOIN news_stats ns        ON tm.ticker = ns.ticker
+LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON ha.ticker = cp.ticker
+LEFT JOIN ltm_financials lf    ON ha.ticker = lf.ticker
+LEFT JOIN compliance c         ON ha.ticker = c.ticker
+LEFT JOIN filing_stats fs      ON ha.ticker = fs.ticker
+LEFT JOIN earnings_stats es    ON ha.ticker = es.ticker
+LEFT JOIN news_stats ns        ON ha.ticker = ns.ticker
 """)
 
 print("✓ Created mv_portfolio_overview")
@@ -257,38 +262,31 @@ CREATE OR REPLACE VIEW {METRICS_SCHEMA}.mv_desk_exposure AS
 WITH latest_date AS (
     SELECT MAX(as_of_date) AS max_date
     FROM {HOLDINGS_TABLE}
-),
-
-dc AS (
-    SELECT ticker_region, ticker
-    FROM {GOLD_SCHEMA}.demo_companies
 )
 
 SELECT
     h.as_of_date,
-    h.desk,
-    dc.ticker,
+    h.trading_desk                      AS desk,
+    h.ticker,
     h.ticker_region,
     cp.company_name,
-    cp.sector,
-    cp.industry,
+    h.sector_name                       AS sector,
     h.asset_class,
     h.book_type,
-    SUM(h.notional_usd)      AS notional_amount,
-    SUM(h.market_value)         AS market_value,
-    SUM(h.`var`)                AS `var`,
-    SUM(h.dv01)                 AS dv01,
-    SUM(h.cs01)                 AS cs01,
-    COUNT(*)                    AS position_count,
-    COUNT(DISTINCT h.trader)    AS trader_count
+    SUM(h.notional_usd)                 AS notional_amount,
+    SUM(h.market_value_usd)             AS market_value,
+    SUM(h.var_95_1d)                    AS var,
+    SUM(h.dv01)                         AS dv01,
+    SUM(h.cs01)                         AS cs01,
+    COUNT(*)                            AS position_count,
+    COUNT(DISTINCT h.trader_name)       AS trader_count
 FROM {HOLDINGS_TABLE} h
 CROSS JOIN latest_date ld
-JOIN dc ON h.ticker_region = dc.ticker_region
-LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON dc.ticker = cp.ticker
+LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON h.ticker = cp.ticker
 WHERE h.as_of_date = ld.max_date
 GROUP BY
-    h.as_of_date, h.desk, dc.ticker, h.ticker_region,
-    cp.company_name, cp.sector, cp.industry,
+    h.as_of_date, h.trading_desk, h.ticker, h.ticker_region,
+    cp.company_name, h.sector_name,
     h.asset_class, h.book_type
 """)
 
@@ -315,20 +313,28 @@ WITH latest_date AS (
 
 portfolio AS (
     SELECT
-        dc.ticker,
-        SUM(h.notional_usd) AS firm_notional,
+        h.ticker,
+        SUM(h.notional_usd)    AS firm_notional,
         COUNT(*)               AS firm_position_count
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
-    JOIN {GOLD_SCHEMA}.demo_companies dc ON h.ticker_region = dc.ticker_region
     WHERE h.as_of_date = ld.max_date
-    GROUP BY dc.ticker
+    GROUP BY h.ticker
+),
+
+-- Sector not available in company_profile; source from holdings
+sector_lookup AS (
+    SELECT ticker, MAX(sector_name) AS sector
+    FROM {HOLDINGS_TABLE}
+    CROSS JOIN latest_date ld
+    WHERE as_of_date = ld.max_date
+    GROUP BY ticker
 )
 
 SELECT
     ce.ticker,
     cp.company_name,
-    cp.sector,
+    sl.sector,
     YEAR(ce.period_date)    AS fiscal_year,
     QUARTER(ce.period_date) AS fiscal_quarter,
     ce.period_date,
@@ -343,6 +349,7 @@ SELECT
 FROM {GOLD_SCHEMA}.consensus_estimates ce
 JOIN portfolio p ON ce.ticker = p.ticker
 LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON ce.ticker = cp.ticker
+LEFT JOIN sector_lookup sl ON ce.ticker = sl.ticker
 """)
 
 print("✓ Created mv_earnings_performance")
@@ -354,42 +361,50 @@ print("✓ Created mv_earnings_performance")
 # MAGIC ## Step 5: Metric View 4 — Risk & Compliance
 # MAGIC
 # MAGIC Positions from the risk concentration monitor enriched with company profile.
-# MAGIC Includes positions >$10M or with compliance flags.
 # MAGIC Answers: "Which positions have regulatory or concentration risk?"
+# MAGIC
+# MAGIC **Note:** Risk monitor does NOT have: ticker_region, market_value, book_type, counterparty.
+# MAGIC It DOES have: instrument_name, position_direction, isin.
+# MAGIC Flag columns: volcker_covered, restricted_list, material_non_public, concentration_flag.
 
 # COMMAND ----------
 
 spark.sql(f"""
 CREATE OR REPLACE VIEW {METRICS_SCHEMA}.mv_risk_compliance AS
 
+WITH sector_lookup AS (
+    SELECT ticker, MAX(sector_name) AS sector
+    FROM {HOLDINGS_TABLE}
+    WHERE as_of_date = (SELECT MAX(as_of_date) FROM {HOLDINGS_TABLE})
+    GROUP BY ticker
+)
+
 SELECT
     r.as_of_date,
-    dc.ticker,
-    r.ticker_region,
+    r.ticker,
+    r.instrument_name,
+    r.isin,
     cp.company_name,
-    cp.sector,
-    cp.industry,
-    r.desk,
+    sl.sector,
+    r.trading_desk                                              AS desk,
     r.asset_class,
-    r.book_type,
-    r.notional_amount,
-    r.market_value,
-    r.volcker_flag,
-    r.restricted_list_flag,
-    r.mnpi_flag,
+    r.position_direction,
+    r.notional_usd                                              AS notional_amount,
+    r.volcker_covered                                           AS volcker_flag,
+    r.restricted_list                                           AS restricted_list_flag,
+    r.material_non_public                                       AS mnpi_flag,
     r.concentration_flag,
-    (CASE WHEN r.volcker_flag THEN 1 ELSE 0 END
-   + CASE WHEN r.restricted_list_flag THEN 1 ELSE 0 END
-   + CASE WHEN r.mnpi_flag THEN 1 ELSE 0 END
-   + CASE WHEN r.concentration_flag THEN 1 ELSE 0 END)  AS flag_count,
-    r.`var`,
+    (CASE WHEN r.volcker_covered THEN 1 ELSE 0 END
+   + CASE WHEN r.restricted_list THEN 1 ELSE 0 END
+   + CASE WHEN r.material_non_public THEN 1 ELSE 0 END
+   + CASE WHEN r.concentration_flag THEN 1 ELSE 0 END)         AS flag_count,
+    r.var_95_1d                                                 AS var,
     r.dv01,
     r.cs01,
-    r.trader,
-    r.counterparty
+    r.trader_name                                               AS trader
 FROM {RISK_TABLE} r
-JOIN {GOLD_SCHEMA}.demo_companies dc ON r.ticker_region = dc.ticker_region
-LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON dc.ticker = cp.ticker
+LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON r.ticker = cp.ticker
+LEFT JOIN sector_lookup sl ON r.ticker = sl.ticker
 """)
 
 print("✓ Created mv_risk_compliance")
@@ -400,42 +415,33 @@ print("✓ Created mv_risk_compliance")
 # MAGIC ---
 # MAGIC ## Step 6: Metric View 5 — Desk P&L
 # MAGIC
-# MAGIC Daily P&L by desk with cumulative running totals and position context.
+# MAGIC Daily P&L by desk with cumulative running totals.
 # MAGIC Answers: "How is each desk performing over time?"
+# MAGIC
+# MAGIC **Note:** v_desk_pnl_daily has no `daily_pnl` column. P&L is computed as
+# MAGIC `unrealized_pnl_usd + realized_pnl_usd`. The table already has `position_count`
+# MAGIC and `gross_notional_usd`, so no need to join to holdings.
 
 # COMMAND ----------
 
 spark.sql(f"""
 CREATE OR REPLACE VIEW {METRICS_SCHEMA}.mv_desk_pnl AS
 
-WITH daily_positions AS (
-    SELECT
-        as_of_date,
-        desk,
-        book_type,
-        COUNT(*)                AS position_count,
-        SUM(notional_usd)       AS total_notional
-    FROM {HOLDINGS_TABLE}
-    GROUP BY as_of_date, desk, book_type
-)
-
 SELECT
     pnl.as_of_date,
-    pnl.desk,
+    pnl.trading_desk                                            AS desk,
     pnl.book_type,
-    pnl.daily_pnl,
-    SUM(pnl.daily_pnl) OVER (
-        PARTITION BY pnl.desk, pnl.book_type
+    (COALESCE(pnl.unrealized_pnl_usd, 0)
+   + COALESCE(pnl.realized_pnl_usd, 0))                        AS daily_pnl,
+    SUM(COALESCE(pnl.unrealized_pnl_usd, 0)
+      + COALESCE(pnl.realized_pnl_usd, 0)) OVER (
+        PARTITION BY pnl.trading_desk, pnl.book_type
         ORDER BY pnl.as_of_date
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS cumulative_pnl,
-    COALESCE(dp.position_count, 0) AS position_count,
-    COALESCE(dp.total_notional, 0) AS total_notional
+    )                                                           AS cumulative_pnl,
+    pnl.position_count,
+    pnl.gross_notional_usd                                      AS total_notional
 FROM {PNL_TABLE} pnl
-LEFT JOIN daily_positions dp
-    ON  pnl.as_of_date = dp.as_of_date
-    AND pnl.desk       = dp.desk
-    AND pnl.book_type  = dp.book_type
 """)
 
 print("✓ Created mv_desk_pnl")
@@ -448,7 +454,11 @@ print("✓ Created mv_desk_pnl")
 # MAGIC
 # MAGIC Quarterly financials for all tracked companies with period-over-period changes.
 # MAGIC Flags which companies are currently in the portfolio.
-# MAGIC Answers: "Show revenue/EBITDA/EPS trends for our holdings."
+# MAGIC Answers: "Show revenue/operating income/EPS trends for our holdings."
+# MAGIC
+# MAGIC **Note:** company_financials uses `operating_income` (not ebitda), `eps` (not eps_diluted).
+# MAGIC Free cash flow is approximated as `operating_cash_flow + investing_cash_flow`.
+# MAGIC Period type for quarterly is `'Q'` (not 'QF'). fiscal_year/fiscal_quarter are DECIMAL columns.
 
 # COMMAND ----------
 
@@ -462,50 +472,59 @@ WITH latest_date AS (
 
 portfolio AS (
     SELECT
-        dc.ticker,
+        h.ticker,
         SUM(h.notional_usd) AS firm_notional
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
-    JOIN {GOLD_SCHEMA}.demo_companies dc ON h.ticker_region = dc.ticker_region
     WHERE h.as_of_date = ld.max_date
-    GROUP BY dc.ticker
+    GROUP BY h.ticker
+),
+
+-- Sector sourced from holdings since company_profile has no sector column
+sector_lookup AS (
+    SELECT ticker, MAX(sector_name) AS sector
+    FROM {HOLDINGS_TABLE}
+    CROSS JOIN latest_date ld
+    WHERE as_of_date = ld.max_date
+    GROUP BY ticker
 )
 
 SELECT
     f.ticker,
     cp.company_name,
-    cp.sector,
-    cp.industry,
+    sl.sector,
     f.period_date,
-    YEAR(f.period_date)     AS fiscal_year,
-    QUARTER(f.period_date)  AS fiscal_quarter,
+    CAST(f.fiscal_year AS INT)                                  AS fiscal_year,
+    CAST(f.fiscal_quarter AS INT)                               AS fiscal_quarter,
     f.period_type,
     f.revenue,
-    f.ebitda,
+    f.operating_income,
     f.net_income,
-    f.eps_diluted,
+    f.eps,
     f.total_debt,
     f.operating_cash_flow,
-    f.free_cash_flow,
-    ROUND(f.total_debt / NULLIF(f.ebitda, 0), 2) AS leverage_ratio,
+    (COALESCE(f.operating_cash_flow, 0)
+   + COALESCE(f.investing_cash_flow, 0))                        AS free_cash_flow,
+    ROUND(f.total_debt / NULLIF(f.operating_income, 0), 2)     AS leverage_ratio,
     ROUND(
         (f.revenue - LAG(f.revenue) OVER (PARTITION BY f.ticker ORDER BY f.period_date))
         / NULLIF(ABS(LAG(f.revenue) OVER (PARTITION BY f.ticker ORDER BY f.period_date)), 0) * 100,
-    1) AS revenue_qoq_pct,
+    1)                                                          AS revenue_qoq_pct,
     ROUND(
-        (f.ebitda - LAG(f.ebitda) OVER (PARTITION BY f.ticker ORDER BY f.period_date))
-        / NULLIF(ABS(LAG(f.ebitda) OVER (PARTITION BY f.ticker ORDER BY f.period_date)), 0) * 100,
-    1) AS ebitda_qoq_pct,
+        (f.operating_income - LAG(f.operating_income) OVER (PARTITION BY f.ticker ORDER BY f.period_date))
+        / NULLIF(ABS(LAG(f.operating_income) OVER (PARTITION BY f.ticker ORDER BY f.period_date)), 0) * 100,
+    1)                                                          AS operating_income_qoq_pct,
     ROUND(
-        (f.eps_diluted - LAG(f.eps_diluted) OVER (PARTITION BY f.ticker ORDER BY f.period_date))
-        / NULLIF(ABS(LAG(f.eps_diluted) OVER (PARTITION BY f.ticker ORDER BY f.period_date)), 0) * 100,
-    1) AS eps_qoq_pct,
-    COALESCE(p.firm_notional, 0)                                    AS firm_notional,
-    CASE WHEN p.ticker IS NOT NULL THEN TRUE ELSE FALSE END         AS in_portfolio
+        (f.eps - LAG(f.eps) OVER (PARTITION BY f.ticker ORDER BY f.period_date))
+        / NULLIF(ABS(LAG(f.eps) OVER (PARTITION BY f.ticker ORDER BY f.period_date)), 0) * 100,
+    1)                                                          AS eps_qoq_pct,
+    COALESCE(p.firm_notional, 0)                                AS firm_notional,
+    CASE WHEN p.ticker IS NOT NULL THEN TRUE ELSE FALSE END     AS in_portfolio
 FROM {GOLD_SCHEMA}.company_financials f
 LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON f.ticker = cp.ticker
+LEFT JOIN sector_lookup sl ON f.ticker = sl.ticker
 LEFT JOIN portfolio p ON f.ticker = p.ticker
-WHERE f.period_type = 'QF'
+WHERE f.period_type = 'Q'
 """)
 
 print("✓ Created mv_financial_trends")
@@ -519,6 +538,9 @@ print("✓ Created mv_financial_trends")
 # MAGIC Document coverage per company: filings, earnings transcripts, and news.
 # MAGIC Flags coverage gaps where portfolio companies lack adequate research documents.
 # MAGIC Answers: "Which holdings have the most/least research coverage?"
+# MAGIC
+# MAGIC **Note:** news_documents uses `is_analyst_commentary` (not has_analyst_commentary).
+# MAGIC earnings_documents `transcript_quarter` is STRING — needs CAST for MAKE_DATE.
 
 # COMMAND ----------
 
@@ -532,13 +554,21 @@ WITH latest_date AS (
 
 portfolio AS (
     SELECT
-        dc.ticker,
+        h.ticker,
         SUM(h.notional_usd) AS firm_notional
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
-    JOIN {GOLD_SCHEMA}.demo_companies dc ON h.ticker_region = dc.ticker_region
     WHERE h.as_of_date = ld.max_date
-    GROUP BY dc.ticker
+    GROUP BY h.ticker
+),
+
+-- Sector sourced from holdings since company_profile has no sector column
+sector_lookup AS (
+    SELECT ticker, MAX(sector_name) AS sector
+    FROM {HOLDINGS_TABLE}
+    CROSS JOIN latest_date ld
+    WHERE as_of_date = ld.max_date
+    GROUP BY ticker
 ),
 
 filing_stats AS (
@@ -555,7 +585,7 @@ earnings_stats AS (
     SELECT
         ticker,
         COUNT(*) AS earnings_count,
-        MAX(LAST_DAY(MAKE_DATE(transcript_year, transcript_quarter * 3, 1))) AS latest_earnings_date
+        MAX(LAST_DAY(MAKE_DATE(transcript_year, CAST(transcript_quarter AS INT) * 3, 1))) AS latest_earnings_date
     FROM {DEMO_SCHEMA}.earnings_documents
     GROUP BY ticker
 ),
@@ -565,7 +595,7 @@ news_stats AS (
         ticker,
         COUNT(*)        AS news_count,
         MAX(story_date) AS latest_news_date,
-        SUM(CASE WHEN has_analyst_commentary THEN 1 ELSE 0 END) AS analyst_commentary_count
+        SUM(CASE WHEN is_analyst_commentary THEN 1 ELSE 0 END) AS analyst_commentary_count
     FROM {DEMO_SCHEMA}.news_documents
     GROUP BY ticker
 ),
@@ -577,7 +607,7 @@ all_tickers AS (
 SELECT
     t.ticker,
     cp.company_name,
-    cp.sector,
+    sl.sector,
     CASE WHEN p.ticker IS NOT NULL THEN TRUE ELSE FALSE END     AS in_portfolio,
     COALESCE(p.firm_notional, 0)                                AS firm_notional,
     COALESCE(fs.filing_count, 0)                                AS filing_count,
@@ -601,6 +631,7 @@ SELECT
     END                                                         AS has_coverage_gap
 FROM all_tickers t
 LEFT JOIN {GOLD_SCHEMA}.company_profile cp ON t.ticker = cp.ticker
+LEFT JOIN sector_lookup sl     ON t.ticker = sl.ticker
 LEFT JOIN portfolio p           ON t.ticker = p.ticker
 LEFT JOIN filing_stats fs       ON t.ticker = fs.ticker
 LEFT JOIN earnings_stats es     ON t.ticker = es.ticker
@@ -631,15 +662,14 @@ view_comments = {
         "__view__": (
             "Executive portfolio overview: one row per company showing total exposure, "
             "latest LTM financials, risk metrics, and research document coverage. "
-            "Primary dimensions: sector, industry, country. "
+            "Primary dimensions: sector, country. "
             "Key measures: total_notional, leverage_ratio, total_var. "
             "Use this view for portfolio-level questions about exposure, financial health, and risk."
         ),
         "ticker": "Short ticker symbol (e.g. NVDA). Primary key for joining to FactSet structured and unstructured data.",
         "ticker_region": "FactSet-format ticker with region suffix (e.g. NVDA-US). Primary key for joining to holdings and position data.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification (e.g. Information Technology, Health Care). Top level of sector > industry hierarchy.",
-        "industry": "GICS industry classification (e.g. Semiconductors, Pharmaceuticals). Second level of sector > industry hierarchy.",
+        "sector": "Sector classification from holdings data (e.g. Information Technology, Health Care).",
         "country": "Country of domicile for the company (e.g. United States, Germany).",
         "total_notional": "Total notional exposure in USD across all desks, asset classes, and book types for this company. Sum of all position notional amounts on the latest as_of_date.",
         "total_market_value": "Total mark-to-market value in USD across all positions for this company on the latest as_of_date.",
@@ -647,11 +677,11 @@ view_comments = {
         "desk_count": "Number of distinct trading desks that hold positions in this company.",
         "asset_class_list": "Comma-separated list of distinct asset classes held for this company (e.g. Equity, Credit, Rates).",
         "ltm_revenue": "Last Twelve Months (LTM) total revenue in USD from FactSet Fundamentals. Trailing 12-month aggregate.",
-        "ltm_ebitda": "Last Twelve Months (LTM) EBITDA in USD from FactSet Fundamentals. Earnings Before Interest, Taxes, Depreciation, and Amortization.",
+        "ltm_operating_income": "Last Twelve Months (LTM) operating income in USD from FactSet Fundamentals.",
         "ltm_net_income": "Last Twelve Months (LTM) net income in USD from FactSet Fundamentals.",
-        "ltm_eps": "Last Twelve Months (LTM) diluted earnings per share in USD from FactSet Fundamentals.",
-        "leverage_ratio": "Total Debt / EBITDA (LTM). Lower is better. Below 2x is conservative, 2-4x is moderate, above 4x is considered highly leveraged. NULL if EBITDA is zero or unavailable.",
-        "total_var": "Total Value-at-Risk in USD across all positions for this company. Higher values indicate greater potential loss exposure.",
+        "ltm_eps": "Last Twelve Months (LTM) earnings per share in USD from FactSet Fundamentals.",
+        "leverage_ratio": "Total Debt / Operating Income (LTM). Lower is better. NULL if operating income is zero or unavailable.",
+        "total_var": "Total Value-at-Risk (95% 1-day) in USD across all positions for this company. Higher values indicate greater potential loss exposure.",
         "total_dv01": "Total DV01 (dollar value of a basis point) in USD. Measures interest rate sensitivity across all positions for this company.",
         "total_cs01": "Total CS01 (credit spread 01) in USD. Measures credit spread sensitivity across all positions for this company.",
         "has_compliance_flags": "TRUE if any position in this company has a Volcker, restricted list, MNPI, or concentration flag. FALSE otherwise.",
@@ -677,13 +707,12 @@ view_comments = {
         "ticker": "Short ticker symbol (e.g. NVDA). Links to FactSet structured and unstructured data.",
         "ticker_region": "FactSet-format ticker with region suffix (e.g. NVDA-US). Links to holdings and position data.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification. Top level of sector > industry hierarchy.",
-        "industry": "GICS industry classification. Second level of sector > industry hierarchy.",
+        "sector": "Sector classification from holdings data.",
         "asset_class": "Asset class of the position (e.g. Equity, Credit, Rates, FX). Categorizes the instrument type.",
         "book_type": "Trading book classification (e.g. Trading, Banking, Hedge). Determines regulatory treatment.",
         "notional_amount": "Total notional exposure in USD for this desk-ticker-asset-book combination.",
         "market_value": "Total mark-to-market value in USD for this desk-ticker-asset-book combination.",
-        "var": "Value-at-Risk in USD for this desk-ticker-asset-book combination. Measures potential loss.",
+        "var": "Value-at-Risk (95% 1-day) in USD for this desk-ticker-asset-book combination. Measures potential loss.",
         "dv01": "DV01 (dollar value of a basis point) in USD. Measures interest rate sensitivity for this group.",
         "cs01": "CS01 (credit spread 01) in USD. Measures credit spread sensitivity for this group.",
         "position_count": "Number of individual positions in this desk-ticker-asset-book combination.",
@@ -702,7 +731,7 @@ view_comments = {
         ),
         "ticker": "Short ticker symbol (e.g. NVDA). Identifies the company.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification for grouping and filtering.",
+        "sector": "Sector classification from holdings data for grouping and filtering.",
         "fiscal_year": "Fiscal year of the earnings period (e.g. 2024). Derived from the period end date.",
         "fiscal_quarter": "Fiscal quarter (1-4) of the earnings period. Derived from the period end date.",
         "period_date": "End date of the fiscal period for which the estimate applies.",
@@ -721,31 +750,29 @@ view_comments = {
     # -----------------------------------------------------------------------
     "mv_risk_compliance": {
         "__view__": (
-            "Risk and compliance monitor: positions with notional above $10M or with regulatory/compliance flags. "
-            "Sourced from the risk concentration monitor. Enriched with company profile for sector/industry context. "
+            "Risk and compliance monitor: positions from the risk concentration monitor enriched with "
+            "company profile and sector data. Includes all flagged and monitored positions. "
             "Use this view to identify positions requiring compliance review or management attention."
         ),
         "as_of_date": "Date of the risk snapshot. Positions and flags are assessed as of this date.",
         "ticker": "Short ticker symbol (e.g. NVDA). Links to FactSet data.",
-        "ticker_region": "FactSet-format ticker with region suffix (e.g. NVDA-US). Links to position systems.",
+        "instrument_name": "Full instrument name for the position (e.g. company name, bond description).",
+        "isin": "International Securities Identification Number for this position.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification for grouping flagged positions.",
-        "industry": "GICS industry classification for detailed categorization of flagged positions.",
+        "sector": "Sector classification from holdings data for grouping flagged positions.",
         "desk": "Trading desk holding the flagged position.",
         "asset_class": "Asset class of the flagged position (e.g. Equity, Credit).",
-        "book_type": "Trading book classification (e.g. Trading, Banking). Affects regulatory treatment.",
-        "notional_amount": "Notional exposure in USD for this flagged position.",
-        "market_value": "Mark-to-market value in USD for this flagged position.",
+        "position_direction": "Direction of the position (e.g. Long, Short).",
+        "notional_amount": "Notional exposure in USD for this position.",
         "volcker_flag": "TRUE if this position is flagged under the Volcker Rule (proprietary trading restrictions). Requires compliance review.",
         "restricted_list_flag": "TRUE if this company is on the firms restricted list (e.g. due to advisory relationship or pending deal). Trading may be prohibited.",
         "mnpi_flag": "TRUE if material non-public information (MNPI) has been identified for this company. Trading restrictions may apply.",
         "concentration_flag": "TRUE if this position exceeds concentration thresholds. May require risk committee approval.",
         "flag_count": "Total number of compliance flags on this position (0-4). Sum of volcker, restricted, MNPI, and concentration flags. Higher counts indicate more compliance concern.",
-        "var": "Value-at-Risk in USD for this flagged position.",
-        "dv01": "DV01 (dollar value of a basis point) in USD for this flagged position.",
-        "cs01": "CS01 (credit spread 01) in USD for this flagged position.",
+        "var": "Value-at-Risk (95% 1-day) in USD for this position.",
+        "dv01": "DV01 (dollar value of a basis point) in USD for this position.",
+        "cs01": "CS01 (credit spread 01) in USD for this position.",
         "trader": "Name of the trader responsible for this position.",
-        "counterparty": "Counterparty name for this position (relevant for OTC derivatives and credit positions).",
     },
 
     # -----------------------------------------------------------------------
@@ -754,15 +781,16 @@ view_comments = {
     "mv_desk_pnl": {
         "__view__": (
             "Daily profit and loss by desk and book type, with cumulative running totals and position context. "
+            "Daily P&L is computed as unrealized_pnl + realized_pnl from the desk P&L table. "
             "Use this view for P&L attribution, desk performance comparison, and trend analysis over time."
         ),
         "as_of_date": "Trading date for this P&L record.",
         "desk": "Trading desk name. Each desk has its own P&L tracked independently.",
         "book_type": "Trading book classification (e.g. Trading, Banking). P&L is tracked per book type.",
-        "daily_pnl": "Profit or loss in USD realized on this specific trading day. Positive is profit, negative is loss.",
+        "daily_pnl": "Profit or loss in USD for this trading day. Computed as unrealized_pnl_usd + realized_pnl_usd. Positive is profit, negative is loss.",
         "cumulative_pnl": "Running cumulative P&L in USD for this desk and book type, ordered by date from earliest to latest. Calculated as SUM(daily_pnl) over all prior dates.",
         "position_count": "Number of positions held on this desk and book type on this date. Provides context for P&L magnitude.",
-        "total_notional": "Total notional exposure in USD for this desk and book type on this date. Provides context for P&L as a percentage of book size.",
+        "total_notional": "Gross notional exposure in USD for this desk and book type on this date. Provides context for P&L as a percentage of book size.",
     },
 
     # -----------------------------------------------------------------------
@@ -771,28 +799,27 @@ view_comments = {
     "mv_financial_trends": {
         "__view__": (
             "Quarterly financial trends for all tracked companies with period-over-period percentage changes. "
-            "Includes revenue, EBITDA, EPS, debt, and cash flow metrics. Flags which companies are currently "
+            "Includes revenue, operating income, EPS, debt, and cash flow metrics. Flags which companies are currently "
             "in the portfolio with firm_notional exposure. Use this view for financial trend analysis and screening."
         ),
         "ticker": "Short ticker symbol (e.g. NVDA). Identifies the company.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification. Top level of sector > industry hierarchy.",
-        "industry": "GICS industry classification. Second level of sector > industry hierarchy.",
+        "sector": "Sector classification from holdings data. NULL for companies not in the portfolio.",
         "period_date": "End date of the fiscal quarter (e.g. 2024-06-30 for Q2 2024).",
-        "fiscal_year": "Calendar year of the period end date (e.g. 2024).",
-        "fiscal_quarter": "Calendar quarter of the period end date (1-4).",
-        "period_type": "Financial period type. Filtered to QF (quarterly fiscal) in this view.",
+        "fiscal_year": "Fiscal year from FactSet Fundamentals (e.g. 2024).",
+        "fiscal_quarter": "Fiscal quarter from FactSet Fundamentals (1-4).",
+        "period_type": "Financial period type. Filtered to Q (quarterly) in this view.",
         "revenue": "Total quarterly revenue in USD from FactSet Fundamentals.",
-        "ebitda": "Quarterly EBITDA in USD. Earnings Before Interest, Taxes, Depreciation, and Amortization.",
+        "operating_income": "Quarterly operating income in USD from FactSet Fundamentals.",
         "net_income": "Quarterly net income in USD from FactSet Fundamentals.",
-        "eps_diluted": "Quarterly diluted earnings per share in USD.",
+        "eps": "Quarterly earnings per share in USD.",
         "total_debt": "Total debt outstanding in USD at period end.",
         "operating_cash_flow": "Operating cash flow in USD for the quarter.",
-        "free_cash_flow": "Free cash flow in USD for the quarter. Typically operating_cash_flow minus capex.",
-        "leverage_ratio": "Total Debt / EBITDA for this quarter. Below 2x is conservative, 2-4x is moderate, above 4x is highly leveraged. NULL if EBITDA is zero.",
+        "free_cash_flow": "Approximate free cash flow in USD: operating_cash_flow + investing_cash_flow.",
+        "leverage_ratio": "Total Debt / Operating Income for this quarter. NULL if operating income is zero.",
         "revenue_qoq_pct": "Revenue quarter-over-quarter change as a percentage. Calculated as (current - prior) / |prior| * 100. Positive means growth.",
-        "ebitda_qoq_pct": "EBITDA quarter-over-quarter change as a percentage. Calculated as (current - prior) / |prior| * 100. Positive means improvement.",
-        "eps_qoq_pct": "Diluted EPS quarter-over-quarter change as a percentage. Calculated as (current - prior) / |prior| * 100. Positive means growth.",
+        "operating_income_qoq_pct": "Operating income quarter-over-quarter change as a percentage. Calculated as (current - prior) / |prior| * 100. Positive means improvement.",
+        "eps_qoq_pct": "EPS quarter-over-quarter change as a percentage. Calculated as (current - prior) / |prior| * 100. Positive means growth.",
         "firm_notional": "Current total notional exposure in USD that the firm holds in this company. Zero if not in portfolio.",
         "in_portfolio": "TRUE if the firm currently holds positions in this company, FALSE otherwise.",
     },
@@ -809,7 +836,7 @@ view_comments = {
         ),
         "ticker": "Short ticker symbol (e.g. NVDA). Identifies the company.",
         "company_name": "Full legal company name from FactSet entity data.",
-        "sector": "GICS sector classification for grouping.",
+        "sector": "Sector classification from holdings data. NULL for companies not in the portfolio.",
         "in_portfolio": "TRUE if the firm currently holds positions in this company, FALSE otherwise.",
         "firm_notional": "Current total notional exposure in USD. Zero if not in portfolio.",
         "filing_count": "Number of SEC filing documents available (10-K, 10-Q, 8-K, etc.).",
@@ -938,7 +965,7 @@ sample_questions = [
     "Which companies in our book have the highest leverage ratios?",
     "Show revenue growth trends for our top 10 holdings by notional",
     "Which holdings beat earnings estimates last quarter?",
-    "What is our exposure to companies with declining EBITDA?",
+    "What is our exposure to companies with declining operating income?",
     # Risk + Compliance
     "Which positions have compliance flags?",
     "Show our largest single-name concentrations",
@@ -996,7 +1023,7 @@ DATA AVAILABLE:
 - Earnings Performance (mv_earnings_performance): Beat/miss analysis for portfolio companies vs consensus estimates
 - Risk & Compliance (mv_risk_compliance): Positions with Volcker, restricted list, MNPI, or concentration flags
 - Desk P&L (mv_desk_pnl): Daily profit and loss by desk with cumulative totals
-- Financial Trends (mv_financial_trends): Quarterly revenue, EBITDA, EPS with period-over-period changes
+- Financial Trends (mv_financial_trends): Quarterly revenue, operating income, EPS with period-over-period changes
 - Research Coverage (mv_research_coverage): SEC filings, earnings transcripts, and news coverage per company
 
 KEY IDENTIFIERS:
