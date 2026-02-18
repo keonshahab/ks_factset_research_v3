@@ -57,6 +57,47 @@ print(f"Genie Space ID:   {GENIE_SPACE_ID}")
 
 # MAGIC %md
 # MAGIC ---
+# MAGIC ## Step 0.5: Schema Discovery
+# MAGIC
+# MAGIC Print the actual columns from every source table so we can verify column names
+# MAGIC before creating views. If a view fails due to a column mismatch, check this output.
+
+# COMMAND ----------
+
+source_tables = [
+    # Holdings & Position tables (cross-catalog)
+    HOLDINGS_TABLE,
+    PNL_TABLE,
+    RISK_TABLE,
+    # FactSet structured (gold)
+    f"{GOLD_SCHEMA}.company_profile",
+    f"{GOLD_SCHEMA}.company_financials",
+    f"{GOLD_SCHEMA}.consensus_estimates",
+    f"{GOLD_SCHEMA}.demo_companies",
+    # FactSet unstructured summaries (demo)
+    f"{DEMO_SCHEMA}.filing_documents",
+    f"{DEMO_SCHEMA}.earnings_documents",
+    f"{DEMO_SCHEMA}.news_documents",
+]
+
+print("=" * 70)
+print("SOURCE TABLE SCHEMA DISCOVERY")
+print("=" * 70)
+
+for tbl in source_tables:
+    try:
+        df = spark.table(tbl)
+        cols = df.dtypes  # list of (name, type) tuples
+        print(f"\n{tbl}  ({len(cols)} columns):")
+        for col_name, col_type in cols:
+            print(f"  {col_name:<40s} {col_type}")
+    except Exception as e:
+        print(f"\n{tbl}  — NOT FOUND: {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
 # MAGIC ## Step 1: Create Metrics Schema
 
 # COMMAND ----------
@@ -87,7 +128,7 @@ WITH latest_date AS (
 holdings_agg AS (
     SELECT
         h.ticker_region,
-        SUM(h.notional_amount)          AS total_notional,
+        SUM(h.notional_usd)          AS total_notional,
         SUM(h.market_value)             AS total_market_value,
         COUNT(*)                        AS position_count,
         COUNT(DISTINCT h.desk)          AS desk_count,
@@ -233,7 +274,7 @@ SELECT
     cp.industry,
     h.asset_class,
     h.book_type,
-    SUM(h.notional_amount)      AS notional_amount,
+    SUM(h.notional_usd)      AS notional_amount,
     SUM(h.market_value)         AS market_value,
     SUM(h.`var`)                AS `var`,
     SUM(h.dv01)                 AS dv01,
@@ -275,7 +316,7 @@ WITH latest_date AS (
 portfolio AS (
     SELECT
         dc.ticker,
-        SUM(h.notional_amount) AS firm_notional,
+        SUM(h.notional_usd) AS firm_notional,
         COUNT(*)               AS firm_position_count
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
@@ -373,7 +414,7 @@ WITH daily_positions AS (
         desk,
         book_type,
         COUNT(*)                AS position_count,
-        SUM(notional_amount)    AS total_notional
+        SUM(notional_usd)       AS total_notional
     FROM {HOLDINGS_TABLE}
     GROUP BY as_of_date, desk, book_type
 )
@@ -422,7 +463,7 @@ WITH latest_date AS (
 portfolio AS (
     SELECT
         dc.ticker,
-        SUM(h.notional_amount) AS firm_notional
+        SUM(h.notional_usd) AS firm_notional
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
     JOIN {GOLD_SCHEMA}.demo_companies dc ON h.ticker_region = dc.ticker_region
@@ -492,7 +533,7 @@ WITH latest_date AS (
 portfolio AS (
     SELECT
         dc.ticker,
-        SUM(h.notional_amount) AS firm_notional
+        SUM(h.notional_usd) AS firm_notional
     FROM {HOLDINGS_TABLE} h
     CROSS JOIN latest_date ld
     JOIN {GOLD_SCHEMA}.demo_companies dc ON h.ticker_region = dc.ticker_region
