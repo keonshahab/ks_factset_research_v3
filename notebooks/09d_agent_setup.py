@@ -407,9 +407,15 @@ try:
         endpoint=AGENT_ENDPOINT,
         inputs={"messages": [{"role": "user", "content": "hello"}]},
     )
-    # If it succeeds, permissions are already fine — nothing to do.
-    print("Endpoint responded successfully — UC permissions are already granted.")
-    serving_principal = "__ALREADY_GRANTED__"
+    # The endpoint may return 200 even when tools fail with permission errors.
+    # Inspect the response content for INSUFFICIENT_PERMISSIONS.
+    _resp_content = str(_test)
+    if "INSUFFICIENT_PERMISSIONS" in _resp_content:
+        print("Endpoint returned 200 but response contains INSUFFICIENT_PERMISSIONS.")
+        print("  Falling back to endpoint permissions lookup to find serving principal ...")
+    else:
+        print("Endpoint responded successfully — UC permissions are already granted.")
+        serving_principal = "__ALREADY_GRANTED__"
 except Exception as _e:
     _err_msg = str(_e)
     # Try to extract current_user from our enhanced error message
