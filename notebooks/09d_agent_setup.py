@@ -8,7 +8,7 @@
 # MAGIC document search (`CitationEngine`), financial analysis (`financial_tools`),
 # MAGIC and position / risk management (`position_tools`).
 # MAGIC
-# MAGIC **LLM:** `system.ai.databricks-claude-opus-4-6` (Databricks-hosted — no API key required)
+# MAGIC **LLM:** `system.ai.databricks-claude-sonnet-4-6` (Databricks-hosted — no API key required)
 # MAGIC
 # MAGIC **Prerequisites:**
 # MAGIC - Notebooks `01`–`08` have been run (tables and vector indexes populated).
@@ -17,7 +17,7 @@
 # MAGIC
 # MAGIC **Architecture:**
 # MAGIC ```
-# MAGIC User question ──► Agent (Claude Opus 4.6) ──► Tool calls ──► Structured response
+# MAGIC User question ──► Agent (Claude Sonnet 4.6) ──► Tool calls ──► Structured response
 # MAGIC                        │                          │
 # MAGIC                        ▼                          ▼
 # MAGIC                   System prompt              14 tools:
@@ -281,7 +281,7 @@ from mlflow.models.resources import (
 )
 
 resources = [
-    DatabricksServingEndpoint(endpoint_name="databricks-claude-opus-4-6"),
+    DatabricksServingEndpoint(endpoint_name="databricks-claude-sonnet-4-6"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.filing_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.earnings_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.news_search_index"),
@@ -634,7 +634,7 @@ print("=" * 70)
 print("AGENT SETUP & DEPLOYMENT COMPLETE")
 print("=" * 70)
 print()
-print(f"LLM:                 {LLM_ENDPOINT} (system.ai.databricks-claude-opus-4-6)")
+print(f"LLM:                 {LLM_ENDPOINT} (system.ai.{LLM_ENDPOINT})")
 print(f"Registered model:    {REGISTERED_MODEL_NAME}")
 print(f"Serving endpoint:    {AGENT_ENDPOINT}")
 print(f"Tools registered:    {len(TOOLS)}")
