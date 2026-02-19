@@ -47,7 +47,7 @@ from src.position_tools import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-LLM_ENDPOINT = "databricks-claude-sonnet-4-5"   # system.ai.databricks-claude-sonnet-4-5
+LLM_ENDPOINT = "databricks-claude-sonnet-4-6"   # system.ai.databricks-claude-sonnet-4-6
 MAX_TOOL_ROUNDS = 8
 WAREHOUSE_ID = "4b9b953939869799"
 
