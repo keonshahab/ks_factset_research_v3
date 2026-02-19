@@ -352,6 +352,164 @@ print(f"  Model Version: {model_info.registered_model_version}")
 
 # MAGIC %md
 # MAGIC ---
+# MAGIC ## Step 5.5: Grant UC Permissions to Serving Endpoint
+# MAGIC
+# MAGIC The serving endpoint runs as a **system service principal** created by the
+# MAGIC Agent Framework.  This principal can authenticate to the SQL warehouse
+# MAGIC (because we declared `DatabricksSQLWarehouse` as a resource), but it still
+# MAGIC needs explicit Unity Catalog GRANT statements for the schemas and tables
+# MAGIC the agent queries:
+# MAGIC
+# MAGIC | Catalog | Schema | Tables |
+# MAGIC |---------|--------|--------|
+# MAGIC | `ks_factset_research_v3` | `gold` | company_profile, company_financials, consensus_estimates, position_exposures, position_pnl, position_risk_flags, demo_companies |
+# MAGIC | `ks_position_sample` | `vendor_data` | factset_symbology_xref |
+# MAGIC
+# MAGIC This step discovers the service principal and runs the GRANTs automatically.
+
+# COMMAND ----------
+
+import re
+import time as _time
+
+deploy_client = get_deploy_client("databricks")
+
+# ── Wait for the endpoint to accept requests ─────────────────────────
+print(f"Waiting for endpoint '{AGENT_ENDPOINT}' to start...")
+_endpoint_ready = False
+for _attempt in range(30):
+    try:
+        deploy_client.predict(
+            endpoint=AGENT_ENDPOINT,
+            inputs={"messages": [{"role": "user", "content": "hello"}]},
+        )
+        _endpoint_ready = True
+        break
+    except Exception as _e:
+        _err = str(_e)
+        # If we get an actual application error (permissions, etc.) the
+        # endpoint IS running — it just can't access the data yet.
+        if any(k in _err for k in ("INSUFFICIENT_PERMISSIONS", "current_user=", "SQL warehouse query failed")):
+            _endpoint_ready = True
+            break
+        _time.sleep(10)
+
+if not _endpoint_ready:
+    print("WARNING: endpoint may not be ready yet. Continuing with grants anyway.\n")
+
+# ── Discover the serving principal ────────────────────────────────────
+# The agent's _SQLWarehouseProxy embeds `current_user=` in error messages.
+# Make a test call and parse the error to get the exact principal name.
+serving_principal = None
+
+try:
+    _test = deploy_client.predict(
+        endpoint=AGENT_ENDPOINT,
+        inputs={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    # If it succeeds, permissions are already fine — nothing to do.
+    print("Endpoint responded successfully — UC permissions are already granted.")
+    serving_principal = "__ALREADY_GRANTED__"
+except Exception as _e:
+    _err_msg = str(_e)
+    # Try to extract current_user from our enhanced error message
+    _match = re.search(r"current_user='([^']+)'", _err_msg)
+    if _match:
+        serving_principal = _match.group(1)
+        print(f"Discovered serving principal: {serving_principal}")
+    else:
+        print("Could not auto-discover the serving principal from the error message.")
+        print(f"  Error snippet: {_err_msg[:300]}")
+        print()
+        print("Falling back to querying the serving endpoint permissions ...")
+
+# ── Fallback: look up the service principal from the endpoint config ──
+if serving_principal is None:
+    try:
+        from databricks.sdk import WorkspaceClient
+        _w = WorkspaceClient()
+        _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
+        _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
+        for _acl in (_perms.access_control_list or []):
+            if hasattr(_acl, "service_principal") and _acl.service_principal:
+                serving_principal = _acl.service_principal.display_name
+                print(f"Discovered serving principal from endpoint permissions: {serving_principal}")
+                break
+    except Exception as _sdk_err:
+        print(f"  SDK lookup failed: {_sdk_err}")
+
+# ── Run the GRANT statements ─────────────────────────────────────────
+if serving_principal and serving_principal != "__ALREADY_GRANTED__":
+    print(f"\nGranting UC permissions to: {serving_principal}\n")
+
+    _grants = [
+        # ── ks_factset_research_v3.gold (financial + position tables) ──
+        f"GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `{serving_principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `{serving_principal}`",
+        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `{serving_principal}`",
+        # ── ks_factset_research_v3.demo (vector search source tables) ──
+        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `{serving_principal}`",
+        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `{serving_principal}`",
+        # ── ks_position_sample.vendor_data (ticker crosswalk) ──
+        f"GRANT USE CATALOG ON CATALOG ks_position_sample TO `{serving_principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `{serving_principal}`",
+        f"GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `{serving_principal}`",
+    ]
+
+    for _stmt in _grants:
+        try:
+            spark.sql(_stmt)
+            print(f"  OK  {_stmt}")
+        except Exception as _ge:
+            err_str = str(_ge)
+            # Ignore "already granted" or "already has" style messages
+            if "already" in err_str.lower():
+                print(f"  SKIP {_stmt}  (already granted)")
+            else:
+                print(f"  WARN {_stmt}")
+                print(f"       -> {err_str[:200]}")
+
+    print("\nUC permissions granted. Testing endpoint again ...\n")
+
+    # Quick verification
+    try:
+        _verify = deploy_client.predict(
+            endpoint=AGENT_ENDPOINT,
+            inputs={
+                "messages": [{"role": "user", "content": "What is NVDA?"}],
+                "custom_inputs": {"ticker": "NVDA"},
+            },
+        )
+        _content = _verify.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"Verification PASSED — response length: {len(_content):,} chars")
+        print(f"  Preview: {_content[:200]}...")
+    except Exception as _ve:
+        print(f"Verification failed: {_ve}")
+        print("The grants may need a few seconds to propagate. Try the Playground again shortly.")
+
+elif serving_principal != "__ALREADY_GRANTED__":
+    print("\n" + "=" * 70)
+    print("MANUAL STEP REQUIRED — Grant UC permissions")
+    print("=" * 70)
+    print()
+    print("Run these SQL commands in a notebook or SQL editor, replacing")
+    print("<PRINCIPAL> with the serving endpoint's identity.")
+    print("(Check the endpoint Logs tab for 'current_user=' to find it.)")
+    print()
+    print("  GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `<PRINCIPAL>`;")
+    print("  GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;")
+    print("  GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;")
+    print("  GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;")
+    print("  GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;")
+    print("  GRANT USE CATALOG ON CATALOG ks_position_sample TO `<PRINCIPAL>`;")
+    print("  GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `<PRINCIPAL>`;")
+    print("  GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `<PRINCIPAL>`;")
+    print()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
 # MAGIC ## Step 6: Test Deployed Endpoint
 
 # COMMAND ----------
