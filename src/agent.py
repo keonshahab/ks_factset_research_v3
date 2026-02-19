@@ -67,27 +67,45 @@ class _DictRow:
 
 
 class _PendingQuery:
-    """Mimics the object returned by `spark.sql(query)` — supports `.collect()`."""
+    """Mimics the object returned by `spark.sql(query)` — supports `.collect()`.
 
-    def __init__(self, cursor, sql, *, proxy_host="", proxy_warehouse_id=""):
-        self._cursor = cursor
+    Each query opens its own connection (with a fresh auth token) and closes
+    it when done.  This avoids stale-connection / expired-token failures in
+    long-running Model Serving containers.
+    """
+
+    def __init__(self, connect_fn, sql, *, proxy_host="", proxy_warehouse_id=""):
+        self._connect_fn = connect_fn
         self._sql = sql
         self._proxy_host = proxy_host
         self._proxy_warehouse_id = proxy_warehouse_id
 
     def collect(self):
+        connection = self._connect_fn()
         try:
-            self._cursor.execute(self._sql)
-        except Exception as e:
-            raise RuntimeError(
-                f"SQL warehouse query failed. "
-                f"host={self._proxy_host!r}, "
-                f"warehouse_id={self._proxy_warehouse_id!r}, "
-                f"sql={self._sql[:200]!r}, "
-                f"error={e}"
-            ) from e
-        columns = [desc[0] for desc in self._cursor.description]
-        return [_DictRow(dict(zip(columns, row))) for row in self._cursor.fetchall()]
+            cursor = connection.cursor()
+            try:
+                cursor.execute(self._sql)
+                columns = [desc[0] for desc in cursor.description]
+                return [_DictRow(dict(zip(columns, row))) for row in cursor.fetchall()]
+            except Exception as e:
+                raise RuntimeError(
+                    f"SQL warehouse query failed. "
+                    f"host={self._proxy_host!r}, "
+                    f"warehouse_id={self._proxy_warehouse_id!r}, "
+                    f"sql={self._sql[:200]!r}, "
+                    f"error={e}"
+                ) from e
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 class _SQLWarehouseProxy:
@@ -97,6 +115,11 @@ class _SQLWarehouseProxy:
     Provides the same ``proxy.sql(query).collect()`` →
     ``[row.asDict() for row in rows]`` interface used by financial_tools
     and position_tools.
+
+    Each ``.sql(query).collect()`` call opens a **fresh** connection with
+    a newly-minted auth token and closes it when done.  This avoids
+    stale-connection / expired-token failures in long-running Model
+    Serving containers.
     """
 
     def __init__(self, warehouse_id: str):
@@ -107,12 +130,12 @@ class _SQLWarehouseProxy:
 
         logger = logging.getLogger("_SQLWarehouseProxy")
 
-        # Use the SDK auth chain — it automatically resolves credentials
-        # in Model Serving, notebooks, and local dev environments.
-        cfg = Config()
+        # Store for per-query connection creation
+        self._dbsql = dbsql
+        self._cfg = Config()
 
         self._host = (
-            (cfg.host or "")
+            (self._cfg.host or "")
             .removeprefix("https://")
             .removeprefix("http://")
             .rstrip("/")
@@ -126,34 +149,18 @@ class _SQLWarehouseProxy:
         self._warehouse_id = warehouse_id
         self._http_path = f"/sql/1.0/warehouses/{warehouse_id}"
 
-        # Extract Bearer token from SDK auth headers
-        headers = cfg.authenticate()
-        token = headers.get("Authorization", "").removeprefix("Bearer ")
-        if not token:
-            raise RuntimeError(
-                "_SQLWarehouseProxy: No auth token found via SDK Config. "
-                f"Auth type = {cfg.auth_type}, "
-                f"DATABRICKS_TOKEN env var set = {bool(os.environ.get('DATABRICKS_TOKEN'))}"
-            )
-
-        logger.info(
-            "_SQLWarehouseProxy: connecting to host=%r, http_path=%r, auth_type=%s, token_len=%d",
+        logger.warning(
+            "_SQLWarehouseProxy: host=%r, http_path=%r, auth_type=%s",
             self._host,
             self._http_path,
-            cfg.auth_type,
-            len(token),
-        )
-
-        self._connection = dbsql.connect(
-            server_hostname=self._host,
-            http_path=self._http_path,
-            access_token=token,
+            self._cfg.auth_type,
         )
 
         # Verify connectivity and log the actual identity so we know
         # exactly who to grant UC permissions to.
+        conn = self._new_connection()
         try:
-            cur = self._connection.cursor()
+            cur = conn.cursor()
             cur.execute("SELECT current_user() AS current_user, session_user() AS session_user")
             row = cur.fetchone()
             cur.close()
@@ -167,14 +174,34 @@ class _SQLWarehouseProxy:
             raise RuntimeError(
                 f"_SQLWarehouseProxy: connection test failed. "
                 f"host={self._host!r}, http_path={self._http_path!r}, "
-                f"auth_type={cfg.auth_type}, error={e}"
+                f"auth_type={self._cfg.auth_type}, error={e}"
             ) from e
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _new_connection(self):
+        """Create a fresh connection with current credentials."""
+        headers = self._cfg.authenticate()
+        token = headers.get("Authorization", "").removeprefix("Bearer ")
+        if not token:
+            raise RuntimeError(
+                "_SQLWarehouseProxy: No auth token found via SDK Config. "
+                f"Auth type = {self._cfg.auth_type}, "
+                f"DATABRICKS_TOKEN env var set = {bool(os.environ.get('DATABRICKS_TOKEN'))}"
+            )
+        return self._dbsql.connect(
+            server_hostname=self._host,
+            http_path=self._http_path,
+            access_token=token,
+        )
 
     def sql(self, query):
-        """Return a _PendingQuery whose .collect() executes the SQL."""
-        cursor = self._connection.cursor()
+        """Return a _PendingQuery whose .collect() opens a fresh connection."""
         return _PendingQuery(
-            cursor, query,
+            self._new_connection, query,
             proxy_host=self._host,
             proxy_warehouse_id=self._warehouse_id,
         )
