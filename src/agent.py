@@ -74,11 +74,12 @@ class _PendingQuery:
     long-running Model Serving containers.
     """
 
-    def __init__(self, connect_fn, sql, *, proxy_host="", proxy_warehouse_id=""):
+    def __init__(self, connect_fn, sql, *, proxy_host="", proxy_warehouse_id="", proxy_user=""):
         self._connect_fn = connect_fn
         self._sql = sql
         self._proxy_host = proxy_host
         self._proxy_warehouse_id = proxy_warehouse_id
+        self._proxy_user = proxy_user
 
     def collect(self):
         connection = self._connect_fn()
@@ -93,6 +94,7 @@ class _PendingQuery:
                     f"SQL warehouse query failed. "
                     f"host={self._proxy_host!r}, "
                     f"warehouse_id={self._proxy_warehouse_id!r}, "
+                    f"current_user={self._proxy_user!r}, "
                     f"sql={self._sql[:200]!r}, "
                     f"error={e}"
                 ) from e
@@ -157,18 +159,23 @@ class _SQLWarehouseProxy:
         )
 
         # Verify connectivity and log the actual identity so we know
-        # exactly who to grant UC permissions to.
+        # exactly who to grant UC permissions to.  Store the identity
+        # so it can be included in query-time error messages.
+        self._current_user = "UNKNOWN"
+        self._session_user = "UNKNOWN"
         conn = self._new_connection()
         try:
             cur = conn.cursor()
             cur.execute("SELECT current_user() AS current_user, session_user() AS session_user")
             row = cur.fetchone()
             cur.close()
+            self._current_user = row[0] if row else "UNKNOWN"
+            self._session_user = row[1] if row and len(row) > 1 else "UNKNOWN"
             logger.warning(
                 "_SQLWarehouseProxy: connection test passed. "
                 "current_user=%s, session_user=%s",
-                row[0] if row else "UNKNOWN",
-                row[1] if row and len(row) > 1 else "UNKNOWN",
+                self._current_user,
+                self._session_user,
             )
         except Exception as e:
             raise RuntimeError(
@@ -204,6 +211,7 @@ class _SQLWarehouseProxy:
             self._new_connection, query,
             proxy_host=self._host,
             proxy_warehouse_id=self._warehouse_id,
+            proxy_user=self._current_user,
         )
 
 
@@ -925,9 +933,15 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
 
                 with mlflow.start_span(name=f"tool_{fn_name}") as tspan:
                     tspan.set_inputs(fn_args)
-                    tool_result = execute_tool(
-                        fn_name, fn_args, self.engine, self.spark,
-                    )
+                    try:
+                        tool_result = execute_tool(
+                            fn_name, fn_args, self.engine, self.spark,
+                        )
+                    except Exception as tool_err:
+                        tool_result = json.dumps({
+                            "error": str(tool_err),
+                            "tool": fn_name,
+                        })
                     tspan.set_outputs({"result_length": len(tool_result)})
 
                 conversation.append({
