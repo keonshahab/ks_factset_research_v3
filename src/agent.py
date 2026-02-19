@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mlflow
 import mlflow.pyfunc
@@ -910,8 +911,8 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             # Append assistant message (with tool_calls) to conversation
             conversation.append(message)
 
-            # Execute each tool call
-            for tc in tool_calls:
+            # Execute tool calls in parallel
+            def _run_tool(tc):
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"]["arguments"])
 
@@ -944,10 +945,21 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                         })
                     tspan.set_outputs({"result_length": len(tool_result)})
 
+                return tc["id"], tool_result
+
+            with ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
+                futures = {pool.submit(_run_tool, tc): tc for tc in tool_calls}
+                results = {}
+                for future in as_completed(futures):
+                    call_id, result = future.result()
+                    results[call_id] = result
+
+            # Append tool results in original order (must match tool_calls order)
+            for tc in tool_calls:
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": tool_result,
+                    "content": results[tc["id"]],
                 })
 
         # Safety: hit max rounds without a final text answer

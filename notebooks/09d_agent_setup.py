@@ -399,37 +399,45 @@ if not _endpoint_ready:
 
 # ── Discover the serving principal ────────────────────────────────────
 # The agent's _SQLWarehouseProxy embeds `current_user=` in error messages.
-# Make a test call and parse the error to get the exact principal name.
+# We force a SQL-dependent tool call (Debt/Equity) so that INSUFFICIENT_PERMISSIONS
+# errors surface even when the endpoint returns HTTP 200.
 serving_principal = None
 
-# Use a query that forces a SQL tool call so permission errors surface.
-_discovery_msg = "List the top 3 tickers in the financial data."
+# This question forces calculate_leverage_ratio → hits gold schema via SQL.
+_discovery_msg = "What is the Debt/Equity ratio for NVDA?"
 try:
     _test = deploy_client.predict(
         endpoint=AGENT_ENDPOINT,
         inputs={
             "messages": [{"role": "user", "content": _discovery_msg}],
-            "custom_inputs": {"ticker": "AAPL"},
+            "custom_inputs": {"ticker": "NVDA"},
         },
     )
-    # The endpoint may return 200 even when tools fail with permission errors.
-    # Inspect the response content for INSUFFICIENT_PERMISSIONS.
     _resp_content = str(_test)
-    if "INSUFFICIENT_PERMISSIONS" in _resp_content:
-        print("Endpoint returned 200 but response contains INSUFFICIENT_PERMISSIONS.")
-        # Try to extract current_user from the response text
-        _match = re.search(r"current_user='([^']+)'", _resp_content)
-        if _match:
-            serving_principal = _match.group(1)
-            print(f"Discovered serving principal from response: {serving_principal}")
-        else:
-            print("  Could not extract principal from response. Falling back to SDK lookup ...")
+    # Check for permission errors in the response body (endpoint returns 200
+    # even when tools fail internally — the LLM just reports the error).
+    _match = re.search(r"current_user='([^']+)'", _resp_content)
+    if _match:
+        serving_principal = _match.group(1)
+        print(f"Discovered serving principal from response: {serving_principal}")
+        # Check if the response also contains real data despite the error
+        if "INSUFFICIENT_PERMISSIONS" not in _resp_content:
+            print("  (Permissions appear OK — will verify after grants.)")
+    elif "INSUFFICIENT_PERMISSIONS" in _resp_content:
+        print("Endpoint has permission errors but could not extract principal.")
+        print("  Falling back to SDK lookup ...")
     else:
-        print("Endpoint responded successfully — UC permissions are already granted.")
-        serving_principal = "__ALREADY_GRANTED__"
+        # Verify the response actually contains financial data, not just
+        # a text answer from the LLM's training knowledge.
+        _has_data = any(k in _resp_content for k in ("Debt/Equity", "debt_to_equity", "leverage"))
+        if _has_data:
+            print("Endpoint responded with financial data — UC permissions are already granted.")
+            serving_principal = "__ALREADY_GRANTED__"
+        else:
+            print("Endpoint responded but unclear if SQL tools worked. Running grants to be safe ...")
+            print("  Falling back to SDK lookup ...")
 except Exception as _e:
     _err_msg = str(_e)
-    # Try to extract current_user from our enhanced error message
     _match = re.search(r"current_user='([^']+)'", _err_msg)
     if _match:
         serving_principal = _match.group(1)
@@ -507,18 +515,22 @@ if serving_principal and serving_principal != "__ALREADY_GRANTED__":
 
     print("\nUC permissions granted. Testing endpoint again ...\n")
 
-    # Quick verification
+    # Quick verification — use a SQL-forcing question to confirm grants work
     try:
         _verify = deploy_client.predict(
             endpoint=AGENT_ENDPOINT,
             inputs={
-                "messages": [{"role": "user", "content": "What is NVDA?"}],
+                "messages": [{"role": "user", "content": "What is the Debt/Equity ratio for NVDA?"}],
                 "custom_inputs": {"ticker": "NVDA"},
             },
         )
         _content = _verify.get("choices", [{}])[0].get("message", {}).get("content", "")
-        print(f"Verification PASSED — response length: {len(_content):,} chars")
-        print(f"  Preview: {_content[:200]}...")
+        if "INSUFFICIENT_PERMISSIONS" in _content:
+            print(f"Verification FAILED — still seeing INSUFFICIENT_PERMISSIONS")
+            print(f"  Preview: {_content[:300]}")
+        else:
+            print(f"Verification PASSED — response length: {len(_content):,} chars")
+            print(f"  Preview: {_content[:200]}...")
     except Exception as _ve:
         print(f"Verification failed: {_ve}")
         print("The grants may need a few seconds to propagate. Try the Playground again shortly.")
