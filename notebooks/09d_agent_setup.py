@@ -402,17 +402,28 @@ if not _endpoint_ready:
 # Make a test call and parse the error to get the exact principal name.
 serving_principal = None
 
+# Use a query that forces a SQL tool call so permission errors surface.
+_discovery_msg = "List the top 3 tickers in the financial data."
 try:
     _test = deploy_client.predict(
         endpoint=AGENT_ENDPOINT,
-        inputs={"messages": [{"role": "user", "content": "hello"}]},
+        inputs={
+            "messages": [{"role": "user", "content": _discovery_msg}],
+            "custom_inputs": {"ticker": "AAPL"},
+        },
     )
     # The endpoint may return 200 even when tools fail with permission errors.
     # Inspect the response content for INSUFFICIENT_PERMISSIONS.
     _resp_content = str(_test)
     if "INSUFFICIENT_PERMISSIONS" in _resp_content:
         print("Endpoint returned 200 but response contains INSUFFICIENT_PERMISSIONS.")
-        print("  Falling back to endpoint permissions lookup to find serving principal ...")
+        # Try to extract current_user from the response text
+        _match = re.search(r"current_user='([^']+)'", _resp_content)
+        if _match:
+            serving_principal = _match.group(1)
+            print(f"Discovered serving principal from response: {serving_principal}")
+        else:
+            print("  Could not extract principal from response. Falling back to SDK lookup ...")
     else:
         print("Endpoint responded successfully — UC permissions are already granted.")
         serving_principal = "__ALREADY_GRANTED__"
@@ -435,12 +446,31 @@ if serving_principal is None:
         from databricks.sdk import WorkspaceClient
         _w = WorkspaceClient()
         _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
-        _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
-        for _acl in (_perms.access_control_list or []):
-            if hasattr(_acl, "service_principal") and _acl.service_principal:
-                serving_principal = _acl.service_principal.display_name
-                print(f"Discovered serving principal from endpoint permissions: {serving_principal}")
+
+        # Method 1: Check served_entities for environment_vars or owner info
+        for _entity in (_ep.config.served_entities or []):
+            _entity_str = str(_entity)
+            # Some Agent Framework endpoints embed the SP name in env vars
+            _sp_match = re.search(r"service.principal[._]?(?:name)?['\"]?\s*[:=]\s*['\"]?([^'\"}\s,]+)", _entity_str, re.IGNORECASE)
+            if _sp_match:
+                serving_principal = _sp_match.group(1)
+                print(f"Discovered serving principal from served_entities: {serving_principal}")
                 break
+
+        # Method 2: Check endpoint ACL for a service principal
+        if serving_principal is None:
+            _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
+            for _acl in (_perms.access_control_list or []):
+                if getattr(_acl, "service_principal_name", None):
+                    serving_principal = _acl.service_principal_name
+                    print(f"Discovered serving principal from endpoint ACL: {serving_principal}")
+                    break
+
+        # Method 3: Use the endpoint creator/owner as a last resort
+        if serving_principal is None and getattr(_ep, "creator", None):
+            serving_principal = _ep.creator
+            print(f"Using endpoint creator as principal: {serving_principal}")
+
     except Exception as _sdk_err:
         print(f"  SDK lookup failed: {_sdk_err}")
 
