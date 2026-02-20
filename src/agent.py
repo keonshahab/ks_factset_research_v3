@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mlflow
@@ -695,6 +696,83 @@ TOOLS = [
 # Tool Dispatcher
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pre-fetch helpers (detect "full briefing" requests before the first LLM call)
+# ---------------------------------------------------------------------------
+
+_BRIEFING_PATTERNS = [
+    "full briefing", "full credit", "full equity", "full report",
+    "complete analysis", "comprehensive",
+    "tell me everything", "research report", "research briefing",
+    "credit briefing", "equity briefing",
+    "all in one report", "one report",
+]
+
+# Common English words that look like tickers but aren't
+_NON_TICKERS = frozenset({
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER",
+    "WAS", "ONE", "OUR", "OUT", "HAS", "HIS", "HOW", "ITS", "LET", "MAY",
+    "NEW", "NOW", "OLD", "SEE", "WAY", "WHO", "DID", "GET", "HIM", "MAN",
+    "SAY", "SHE", "TOO", "USE", "SEC", "EPS", "LTM", "YOY", "QOQ", "PNL",
+    "API", "SQL", "USD", "ETF", "IPO", "CEO", "CFO", "COO", "CTO",
+})
+
+
+def _is_briefing_request(text: str) -> bool:
+    """Return True if the user text looks like a comprehensive briefing request."""
+    lower = text.lower()
+    return any(p in lower for p in _BRIEFING_PATTERNS)
+
+
+def _extract_ticker_from_text(text: str) -> str | None:
+    """Try to extract a ticker symbol from user text.
+
+    Looks for patterns like 'on NVDA', 'for AAPL', 'about MSFT', or
+    standalone uppercase words (2-5 chars) that aren't common English words.
+    """
+    # Try explicit patterns first: "on NVDA", "for AAPL", "about MSFT"
+    match = re.search(
+        r"\b(?:on|for|about|of|ticker[:\s]*)\s+([A-Z]{1,5})\b", text
+    )
+    if match and match.group(1) not in _NON_TICKERS:
+        return match.group(1)
+
+    # Fallback: any standalone uppercase 2-5 char word that looks like a ticker
+    for word in re.findall(r"\b([A-Z]{2,5})\b", text):
+        if word not in _NON_TICKERS:
+            return word
+
+    return None
+
+
+def _slim_briefing(results: dict) -> dict:
+    """Strip verbose metadata from briefing results to reduce token count.
+
+    Removes ``calculation_steps``, ``sources``, and ``*_raw`` fields from
+    every sub-result.  Keeps all user-facing data and citation text intact.
+    """
+    slimmed = {}
+    for key, value in results.items():
+        if isinstance(value, dict):
+            slimmed[key] = {
+                k: v
+                for k, v in value.items()
+                if k not in ("calculation_steps", "sources")
+                and not k.endswith("_raw")
+            }
+            # Recurse one level into nested dicts (e.g., result.exposure)
+            inner = slimmed[key].get("result")
+            if isinstance(inner, dict):
+                slimmed[key]["result"] = {
+                    k: v
+                    for k, v in inner.items()
+                    if not k.endswith("_raw")
+                }
+        else:
+            slimmed[key] = value
+    return slimmed
+
+
 def _search_for_briefing(engine, query, source_types, ticker):
     """Helper: run a semantic search and return a serializable dict."""
     results = engine.search(
@@ -764,7 +842,7 @@ def _execute_full_briefing(ticker, engine, spark_session):
             except Exception as e:
                 results[key] = {"error": str(e)}
 
-    return results
+    return _slim_briefing(results)
 
 
 def execute_tool(tool_name, arguments, engine, spark_session):
@@ -999,6 +1077,46 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                 conversation.append(msg)
             else:
                 conversation.append({"role": msg.role, "content": msg.content})
+
+        # ── Pre-fetch: detect "full briefing" and run tools before LLM ──
+        last_user_text = ""
+        for msg in reversed(messages):
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if role == "user" and content:
+                last_user_text = content
+                break
+
+        prefetch_ticker = ticker or _extract_ticker_from_text(last_user_text)
+
+        if prefetch_ticker and _is_briefing_request(last_user_text):
+            with mlflow.start_span(name="prefetch_full_briefing") as pf_span:
+                pf_span.set_inputs({"ticker": prefetch_ticker})
+                prefetch_data = _execute_full_briefing(
+                    prefetch_ticker, self.engine, self.spark,
+                )
+                pf_span.set_outputs({"sections": list(prefetch_data.keys())})
+
+            # Inject a synthetic tool-call cycle so the LLM sees pre-fetched
+            # data as if it had called get_full_briefing itself.
+            synth_call_id = "prefetch_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_full_briefing",
+                        "arguments": json.dumps({"ticker": prefetch_ticker}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": json.dumps(prefetch_data, default=str),
+            })
 
         # ── Tool-calling loop ────────────────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):
