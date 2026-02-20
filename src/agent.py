@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mlflow
@@ -265,13 +266,27 @@ exposure, P&L trends, and any active risk flags. If not in the book, state that 
 6. **Confidence** — State HIGH / MEDIUM / LOW based on source relevance scores.
 7. **Related Questions** — Suggest 2-3 follow-up questions the analyst might find useful.
 
+## Performance Guidelines
+
+- **For comprehensive / full briefing requests** (e.g., "full briefing", "complete \
+analysis", "tell me everything about", "research report on"), ALWAYS use the \
+`get_full_briefing` tool. It runs all financial, position, and document searches \
+in parallel and returns everything in one call. This is much faster than calling \
+individual tools one by one.
+- **For any question, call ALL tools you need in a single round.** Do not spread \
+tool calls across multiple rounds when you can anticipate what data you need upfront. \
+For example, if you need both financial data and document search results, call all \
+of them together in the same round.
+- Prefer `get_position_summary` over calling `get_firm_exposure` + `get_risk_flags` \
+separately — it returns both plus top positions in one call.
+
 ## Rules
 
 - **Always proactively check positions** when answering research questions about a \
 ticker. Even if the user only asks about fundamentals, include a brief position \
 context section.
 - Use the `get_position_summary` tool whenever a ticker is mentioned to check if it \
-is in the book.
+is in the book (or use `get_full_briefing` which includes it).
 - Cite specific numbers — never say "revenue grew" without stating the amount and \
 percentage.
 - When comparing periods, always show both absolute values and percentage changes.
@@ -531,6 +546,33 @@ TOOLS = [
             },
         },
     },
+    # ── Composite Tool (1) ───────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_full_briefing",
+            "description": (
+                "Comprehensive research briefing — runs ALL financial tools, position "
+                "tools, and document searches in parallel for a single ticker. Returns "
+                "company profile, financial summary (LTM), leverage ratios, DSCR, "
+                "covenant compliance (standard thresholds), earnings vs estimates "
+                "(EPS + Revenue, last 4 quarters), position summary, desk P&L (30 days), "
+                "risk flags, plus semantic search results from earnings transcripts, "
+                "SEC filings, and news. Use this for comprehensive / full briefing "
+                "requests instead of calling many individual tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "Ticker symbol (e.g. 'NVDA').",
+                    },
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
     # ── Position Tools (5) ───────────────────────────────────────────
     {
         "type": "function",
@@ -654,10 +696,166 @@ TOOLS = [
 # Tool Dispatcher
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pre-fetch helpers (detect "full briefing" requests before the first LLM call)
+# ---------------------------------------------------------------------------
+
+_BRIEFING_PATTERNS = [
+    "full briefing", "full credit", "full equity", "full report",
+    "complete analysis", "comprehensive",
+    "tell me everything", "research report", "research briefing",
+    "credit briefing", "equity briefing",
+    "all in one report", "one report",
+]
+
+# Common English words that look like tickers but aren't
+_NON_TICKERS = frozenset({
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER",
+    "WAS", "ONE", "OUR", "OUT", "HAS", "HIS", "HOW", "ITS", "LET", "MAY",
+    "NEW", "NOW", "OLD", "SEE", "WAY", "WHO", "DID", "GET", "HIM", "MAN",
+    "SAY", "SHE", "TOO", "USE", "SEC", "EPS", "LTM", "YOY", "QOQ", "PNL",
+    "API", "SQL", "USD", "ETF", "IPO", "CEO", "CFO", "COO", "CTO",
+})
+
+
+def _is_briefing_request(text: str) -> bool:
+    """Return True if the user text looks like a comprehensive briefing request."""
+    lower = text.lower()
+    return any(p in lower for p in _BRIEFING_PATTERNS)
+
+
+def _extract_ticker_from_text(text: str) -> str | None:
+    """Try to extract a ticker symbol from user text.
+
+    Looks for patterns like 'on NVDA', 'for AAPL', 'about MSFT', or
+    standalone uppercase words (2-5 chars) that aren't common English words.
+    """
+    # Try explicit patterns first: "on NVDA", "for AAPL", "about MSFT"
+    match = re.search(
+        r"\b(?:on|for|about|of|ticker[:\s]*)\s+([A-Z]{1,5})\b", text
+    )
+    if match and match.group(1) not in _NON_TICKERS:
+        return match.group(1)
+
+    # Fallback: any standalone uppercase 2-5 char word that looks like a ticker
+    for word in re.findall(r"\b([A-Z]{2,5})\b", text):
+        if word not in _NON_TICKERS:
+            return word
+
+    return None
+
+
+def _slim_briefing(results: dict) -> dict:
+    """Strip verbose metadata from briefing results to reduce token count.
+
+    Removes ``calculation_steps``, ``sources``, and ``*_raw`` fields from
+    every sub-result.  Keeps all user-facing data and citation text intact.
+    """
+    slimmed = {}
+    for key, value in results.items():
+        if isinstance(value, dict):
+            slimmed[key] = {
+                k: v
+                for k, v in value.items()
+                if k not in ("calculation_steps", "sources")
+                and not k.endswith("_raw")
+            }
+            # Recurse one level into nested dicts (e.g., result.exposure)
+            inner = slimmed[key].get("result")
+            if isinstance(inner, dict):
+                slimmed[key]["result"] = {
+                    k: v
+                    for k, v in inner.items()
+                    if not k.endswith("_raw")
+                }
+        else:
+            slimmed[key] = value
+    return slimmed
+
+
+def _search_for_briefing(engine, query, source_types, ticker):
+    """Helper: run a semantic search and return a serializable dict."""
+    results = engine.search(
+        query=query,
+        source_types=set(source_types),
+        ticker=ticker,
+        top_k=5,
+    )
+    return {
+        "citations": engine.format_citations(results),
+        "confidence": engine.get_confidence_level(results),
+        "result_count": len(results),
+        "results": [
+            {
+                "doc_name": r.doc_name,
+                "chunk_text": r.chunk_text,
+                "relevance_score": round(r.relevance_score, 4),
+                "source_type": r.source_type,
+            }
+            for r in results
+        ],
+    }
+
+
+def _execute_full_briefing(ticker, engine, spark_session):
+    """Run all tools in parallel for a comprehensive briefing."""
+    tasks = {
+        "company_profile": lambda: get_company_profile(spark_session, ticker),
+        "financial_summary_ltm": lambda: get_financial_summary(spark_session, ticker, "LTM"),
+        "leverage_ratios": lambda: calculate_leverage_ratio(spark_session, ticker),
+        "dscr": lambda: calculate_debt_service_coverage(spark_session, ticker),
+        "covenant_compliance": lambda: check_covenant_compliance(
+            spark_session, ticker,
+            {"debt_to_equity": 3.0, "debt_to_assets": 0.6, "min_dscr": 1.5},
+        ),
+        "eps_vs_estimates": lambda: compare_to_estimates(spark_session, ticker, "EPS", 4),
+        "revenue_vs_estimates": lambda: compare_to_estimates(spark_session, ticker, "REVENUE", 4),
+        "position_summary": lambda: get_position_summary(spark_session, ticker),
+        "desk_pnl_30d": lambda: get_desk_pnl(spark_session, ticker, 30),
+        "earnings_commentary": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} management commentary guidance outlook forward-looking statements",
+            ["earnings"],
+            ticker,
+        ),
+        "sec_filings": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} key risk factors business overview financial condition",
+            ["filings"],
+            ticker,
+        ),
+        "recent_news": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} latest developments analyst ratings price target",
+            ["news"],
+            ticker,
+        ),
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {pool.submit(fn): key for key, fn in tasks.items()}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                results[key] = {"error": str(e)}
+
+    return _slim_briefing(results)
+
+
 def execute_tool(tool_name, arguments, engine, spark_session):
     """Execute a tool by name and return the result as a JSON string."""
+    # ── Composite Tool ───────────────────────────────────────────────
+    if tool_name == "get_full_briefing":
+        return json.dumps(
+            _execute_full_briefing(arguments["ticker"], engine, spark_session),
+            default=str,
+        )
+
     # ── Citation Engine ──────────────────────────────────────────────
-    if tool_name == "search_documents":
+    elif tool_name == "search_documents":
         source_types = set(arguments.get("source_types", [])) or None
         results = engine.search(
             query=arguments["query"],
@@ -879,6 +1077,46 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                 conversation.append(msg)
             else:
                 conversation.append({"role": msg.role, "content": msg.content})
+
+        # ── Pre-fetch: detect "full briefing" and run tools before LLM ──
+        last_user_text = ""
+        for msg in reversed(messages):
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if role == "user" and content:
+                last_user_text = content
+                break
+
+        prefetch_ticker = ticker or _extract_ticker_from_text(last_user_text)
+
+        if prefetch_ticker and _is_briefing_request(last_user_text):
+            with mlflow.start_span(name="prefetch_full_briefing") as pf_span:
+                pf_span.set_inputs({"ticker": prefetch_ticker})
+                prefetch_data = _execute_full_briefing(
+                    prefetch_ticker, self.engine, self.spark,
+                )
+                pf_span.set_outputs({"sections": list(prefetch_data.keys())})
+
+            # Inject a synthetic tool-call cycle so the LLM sees pre-fetched
+            # data as if it had called get_full_briefing itself.
+            synth_call_id = "prefetch_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_full_briefing",
+                        "arguments": json.dumps({"ticker": prefetch_ticker}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": json.dumps(prefetch_data, default=str),
+            })
 
         # ── Tool-calling loop ────────────────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):

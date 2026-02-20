@@ -14,6 +14,7 @@ Usage (in a Databricks notebook):
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -164,14 +165,24 @@ class CitationEngine:
         if source_types is None:
             source_types = ALL_SOURCE_TYPES
 
-        results: List[SearchResult] = []
-
+        # Build list of search tasks to run in parallel
+        tasks: Dict[str, callable] = {}
         if FILINGS in source_types:
-            results.extend(self._search_filings(query, ticker, doc_ids, doc_types, top_k))
+            tasks[FILINGS] = lambda: self._search_filings(query, ticker, doc_ids, doc_types, top_k)
         if EARNINGS in source_types:
-            results.extend(self._search_earnings(query, ticker, doc_ids, top_k))
+            tasks[EARNINGS] = lambda: self._search_earnings(query, ticker, doc_ids, top_k)
         if NEWS in source_types:
-            results.extend(self._search_news(query, ticker, doc_ids, top_k))
+            tasks[NEWS] = lambda: self._search_news(query, ticker, doc_ids, top_k)
+
+        if not tasks:
+            return []
+
+        # Execute all index searches in parallel
+        results: List[SearchResult] = []
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = {pool.submit(fn): key for key, fn in tasks.items()}
+            for future in as_completed(futures):
+                results.extend(future.result())
 
         results.sort(key=lambda r: r.relevance_score, reverse=True)
         return results

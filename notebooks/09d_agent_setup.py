@@ -427,11 +427,13 @@ try:
         print("Endpoint has permission errors but could not extract principal.")
         print("  Falling back to SDK lookup ...")
     else:
-        # Verify the response actually contains financial data, not just
-        # a text answer from the LLM's training knowledge.
-        _has_data = any(k in _resp_content for k in ("Debt/Equity", "debt_to_equity", "leverage"))
-        if _has_data:
-            print("Endpoint responded with financial data — UC permissions are already granted.")
+        # Verify the response actually used SQL tools, not just
+        # the LLM's training knowledge (which can mention "leverage" etc.)
+        _perm_errors = ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS", "permission", "Permission error")
+        _has_perm_error = any(k in _resp_content for k in _perm_errors)
+        _used_live_data = any(k in _resp_content for k in ("Debt/Equity", "debt_to_equity")) and not _has_perm_error
+        if _used_live_data:
+            print("Endpoint responded with live financial data — UC permissions are already granted.")
             serving_principal = "__ALREADY_GRANTED__"
         else:
             print("Endpoint responded but unclear if SQL tools worked. Running grants to be safe ...")
@@ -525,7 +527,7 @@ if serving_principal and serving_principal != "__ALREADY_GRANTED__":
             },
         )
         _content = _verify.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if "INSUFFICIENT_PERMISSIONS" in _content:
+        if any(k in _content for k in ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS", "permissions error", "Permission error")):
             print(f"Verification FAILED — still seeing INSUFFICIENT_PERMISSIONS")
             print(f"  Preview: {_content[:300]}")
         else:
