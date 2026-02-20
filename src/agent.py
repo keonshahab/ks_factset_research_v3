@@ -265,13 +265,27 @@ exposure, P&L trends, and any active risk flags. If not in the book, state that 
 6. **Confidence** — State HIGH / MEDIUM / LOW based on source relevance scores.
 7. **Related Questions** — Suggest 2-3 follow-up questions the analyst might find useful.
 
+## Performance Guidelines
+
+- **For comprehensive / full briefing requests** (e.g., "full briefing", "complete \
+analysis", "tell me everything about", "research report on"), ALWAYS use the \
+`get_full_briefing` tool. It runs all financial, position, and document searches \
+in parallel and returns everything in one call. This is much faster than calling \
+individual tools one by one.
+- **For any question, call ALL tools you need in a single round.** Do not spread \
+tool calls across multiple rounds when you can anticipate what data you need upfront. \
+For example, if you need both financial data and document search results, call all \
+of them together in the same round.
+- Prefer `get_position_summary` over calling `get_firm_exposure` + `get_risk_flags` \
+separately — it returns both plus top positions in one call.
+
 ## Rules
 
 - **Always proactively check positions** when answering research questions about a \
 ticker. Even if the user only asks about fundamentals, include a brief position \
 context section.
 - Use the `get_position_summary` tool whenever a ticker is mentioned to check if it \
-is in the book.
+is in the book (or use `get_full_briefing` which includes it).
 - Cite specific numbers — never say "revenue grew" without stating the amount and \
 percentage.
 - When comparing periods, always show both absolute values and percentage changes.
@@ -531,6 +545,33 @@ TOOLS = [
             },
         },
     },
+    # ── Composite Tool (1) ───────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_full_briefing",
+            "description": (
+                "Comprehensive research briefing — runs ALL financial tools, position "
+                "tools, and document searches in parallel for a single ticker. Returns "
+                "company profile, financial summary (LTM), leverage ratios, DSCR, "
+                "covenant compliance (standard thresholds), earnings vs estimates "
+                "(EPS + Revenue, last 4 quarters), position summary, desk P&L (30 days), "
+                "risk flags, plus semantic search results from earnings transcripts, "
+                "SEC filings, and news. Use this for comprehensive / full briefing "
+                "requests instead of calling many individual tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "Ticker symbol (e.g. 'NVDA').",
+                    },
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
     # ── Position Tools (5) ───────────────────────────────────────────
     {
         "type": "function",
@@ -654,10 +695,89 @@ TOOLS = [
 # Tool Dispatcher
 # ---------------------------------------------------------------------------
 
+def _search_for_briefing(engine, query, source_types, ticker):
+    """Helper: run a semantic search and return a serializable dict."""
+    results = engine.search(
+        query=query,
+        source_types=set(source_types),
+        ticker=ticker,
+        top_k=5,
+    )
+    return {
+        "citations": engine.format_citations(results),
+        "confidence": engine.get_confidence_level(results),
+        "result_count": len(results),
+        "results": [
+            {
+                "doc_name": r.doc_name,
+                "chunk_text": r.chunk_text,
+                "relevance_score": round(r.relevance_score, 4),
+                "source_type": r.source_type,
+            }
+            for r in results
+        ],
+    }
+
+
+def _execute_full_briefing(ticker, engine, spark_session):
+    """Run all tools in parallel for a comprehensive briefing."""
+    tasks = {
+        "company_profile": lambda: get_company_profile(spark_session, ticker),
+        "financial_summary_ltm": lambda: get_financial_summary(spark_session, ticker, "LTM"),
+        "leverage_ratios": lambda: calculate_leverage_ratio(spark_session, ticker),
+        "dscr": lambda: calculate_debt_service_coverage(spark_session, ticker),
+        "covenant_compliance": lambda: check_covenant_compliance(
+            spark_session, ticker,
+            {"debt_to_equity": 3.0, "debt_to_assets": 0.6, "min_dscr": 1.5},
+        ),
+        "eps_vs_estimates": lambda: compare_to_estimates(spark_session, ticker, "EPS", 4),
+        "revenue_vs_estimates": lambda: compare_to_estimates(spark_session, ticker, "REVENUE", 4),
+        "position_summary": lambda: get_position_summary(spark_session, ticker),
+        "desk_pnl_30d": lambda: get_desk_pnl(spark_session, ticker, 30),
+        "earnings_commentary": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} management commentary guidance outlook forward-looking statements",
+            ["earnings"],
+            ticker,
+        ),
+        "sec_filings": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} key risk factors business overview financial condition",
+            ["filings"],
+            ticker,
+        ),
+        "recent_news": lambda: _search_for_briefing(
+            engine,
+            f"{ticker} latest developments analyst ratings price target",
+            ["news"],
+            ticker,
+        ),
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {pool.submit(fn): key for key, fn in tasks.items()}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                results[key] = {"error": str(e)}
+
+    return results
+
+
 def execute_tool(tool_name, arguments, engine, spark_session):
     """Execute a tool by name and return the result as a JSON string."""
+    # ── Composite Tool ───────────────────────────────────────────────
+    if tool_name == "get_full_briefing":
+        return json.dumps(
+            _execute_full_briefing(arguments["ticker"], engine, spark_session),
+            default=str,
+        )
+
     # ── Citation Engine ──────────────────────────────────────────────
-    if tool_name == "search_documents":
+    elif tool_name == "search_documents":
         source_types = set(arguments.get("source_types", [])) or None
         results = engine.search(
             query=arguments["query"],
