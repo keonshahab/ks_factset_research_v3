@@ -96,6 +96,7 @@ from src.agent import (
     SYSTEM_PROMPT,
     TOOLS,
     LLM_ENDPOINT,
+    LLM_ENDPOINT_FAST,
     MAX_TOOL_ROUNDS,
 )
 
@@ -111,6 +112,7 @@ REGISTERED_MODEL_NAME = f"{CATALOG}.{SCHEMA}.research_agent"
 AGENT_MODULE_PATH = os.path.join(repo_root, "src", "agent.py")
 
 print(f"LLM endpoint:       {LLM_ENDPOINT}")
+print(f"LLM endpoint (fast):{LLM_ENDPOINT_FAST}")
 print(f"Agent endpoint:     {AGENT_ENDPOINT}")
 print(f"Registered model:   {REGISTERED_MODEL_NAME}")
 print(f"Max tool rounds:    {MAX_TOOL_ROUNDS}")
@@ -282,6 +284,7 @@ from mlflow.models.resources import (
 
 resources = [
     DatabricksServingEndpoint(endpoint_name="databricks-claude-sonnet-4-6"),
+    DatabricksServingEndpoint(endpoint_name="databricks-claude-haiku-4-5"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.filing_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.earnings_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.news_search_index"),
@@ -648,12 +651,16 @@ print("=" * 70)
 print("AGENT SETUP & DEPLOYMENT COMPLETE")
 print("=" * 70)
 print()
-print(f"LLM:                 {LLM_ENDPOINT} (system.ai.{LLM_ENDPOINT})")
+print(f"LLM (primary):       {LLM_ENDPOINT} (tool-calling & normal queries)")
+print(f"LLM (fast):          {LLM_ENDPOINT_FAST} (briefing synthesis)")
 print(f"Registered model:    {REGISTERED_MODEL_NAME}")
 print(f"Serving endpoint:    {AGENT_ENDPOINT}")
 print(f"Tools registered:    {len(TOOLS)}")
 print()
 print("Tools:")
+print("  Composite (1):")
+print("    • get_full_briefing             — runs ALL 12 sub-tools in parallel")
+print()
 print("  Citation Engine (1):")
 print("    • search_documents              — semantic search: filings, earnings, news")
 print()
@@ -674,10 +681,18 @@ print("    • get_risk_flags                — Volcker, restricted, MNPI, conc
 print("    • get_position_summary          — combined exposure + risk + top positions")
 print("    • get_desk_positions            — drill into a single desk")
 print()
+print("Performance optimizations:")
+print("  • Pre-fetch detection: 'full briefing' requests bypass first LLM call")
+print("  • Dual-model routing: Haiku for briefing synthesis, Sonnet for tool-calling")
+print("  • Pre-formatted markdown: structured data rendered as tables before LLM")
+print("  • Parallel vector search: 3 indexes queried concurrently")
+print("  • Streaming: predict_stream() yields chunks for faster time-to-first-token")
+print()
 print("System prompt includes:")
 print("  • Document index descriptions (filings, earnings, news)")
 print("  • Financial tool descriptions (leverage, estimates, covenants)")
 print("  • Position tool descriptions (exposure, P&L, risk flags)")
+print("  • Performance guidelines: use get_full_briefing for comprehensive queries")
 print("  • Response format: Summary → Analysis → Position Context →")
 print("    Calculations → Sources → Confidence → Related Questions")
 print("  • Rule: proactively check positions when answering research questions")

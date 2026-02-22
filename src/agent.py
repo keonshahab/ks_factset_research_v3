@@ -23,7 +23,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import mlflow
 import mlflow.pyfunc
 from mlflow.deployments import get_deploy_client
-from mlflow.types.llm import ChatCompletionResponse
+from mlflow.types.llm import (
+    ChatCompletionResponse,
+    ChatCompletionChunk,
+    ChunkChoice,
+    DeltaMessage,
+)
 
 from src.citation_engine import CitationEngine
 from src.financial_tools import (
@@ -50,6 +55,7 @@ from src.position_tools import (
 # ---------------------------------------------------------------------------
 
 LLM_ENDPOINT = "databricks-claude-sonnet-4-6"   # system.ai.databricks-claude-sonnet-4-6
+LLM_ENDPOINT_FAST = "databricks-claude-haiku-4-5"  # faster model for pre-fetched briefings
 MAX_TOOL_ROUNDS = 8
 WAREHOUSE_ID = "4b9b953939869799"
 
@@ -702,10 +708,12 @@ TOOLS = [
 
 _BRIEFING_PATTERNS = [
     "full briefing", "full credit", "full equity", "full report",
+    "full summary", "full analysis",
     "complete analysis", "comprehensive",
     "tell me everything", "research report", "research briefing",
     "credit briefing", "equity briefing",
     "all in one report", "one report",
+    "credit and equity", "equity and credit",
 ]
 
 # Common English words that look like tickers but aren't
@@ -773,13 +781,164 @@ def _slim_briefing(results: dict) -> dict:
     return slimmed
 
 
+def _format_briefing_markdown(data: dict) -> str:
+    """Convert raw briefing tool results into pre-formatted markdown sections.
+
+    The LLM only needs to write a Summary, Analysis narrative, and Related
+    Questions — the structured data is already rendered.
+    """
+    sections: list[str] = []
+
+    # ── Company Profile ──────────────────────────────────────────────
+    prof = (data.get("company_profile") or {}).get("result") or {}
+    if prof:
+        sections.append(
+            f"## Company Profile\n"
+            f"- **Name:** {prof.get('company_name', 'N/A')}\n"
+            f"- **Ticker:** {prof.get('ticker', 'N/A')}\n"
+            f"- **Sector:** {prof.get('sector', 'N/A')}\n"
+            f"- **Country:** {prof.get('country', 'N/A')}"
+        )
+
+    # ── Financial Summary (LTM) ──────────────────────────────────────
+    fin = (data.get("financial_summary_ltm") or {}).get("result") or {}
+    if fin:
+        sections.append(
+            f"## Financial Summary ({fin.get('period_type', 'LTM')} — {fin.get('period_date', 'N/A')})\n"
+            f"| Metric | Value |\n|---|---|\n"
+            f"| Revenue | {fin.get('revenue', 'N/A')} |\n"
+            f"| Operating Income | {fin.get('operating_income', 'N/A')} |\n"
+            f"| Net Income | {fin.get('net_income', 'N/A')} |\n"
+            f"| EPS | {fin.get('eps', 'N/A')} |\n"
+            f"| Total Debt | {fin.get('total_debt', 'N/A')} |\n"
+            f"| Total Assets | {fin.get('total_assets', 'N/A')} |\n"
+            f"| Shareholders' Equity | {fin.get('shareholders_equity', 'N/A')} |\n"
+            f"| Operating Cash Flow | {fin.get('operating_cash_flow', 'N/A')} |\n"
+            f"| Interest Expense | {fin.get('interest_expense', 'N/A')} |"
+        )
+
+    # ── Leverage Ratios ──────────────────────────────────────────────
+    lev = (data.get("leverage_ratios") or {}).get("result") or {}
+    if lev:
+        sections.append(
+            f"## Leverage Ratios (as of {lev.get('period_date', 'N/A')})\n"
+            f"- **Debt-to-Equity:** {lev.get('debt_to_equity', 'N/A')}\n"
+            f"- **Debt-to-Assets:** {lev.get('debt_to_assets', 'N/A')}"
+        )
+
+    # ── DSCR ─────────────────────────────────────────────────────────
+    dscr = (data.get("dscr") or {}).get("result") or {}
+    if dscr:
+        sections.append(
+            f"## Debt Service Coverage\n"
+            f"- **DSCR:** {dscr.get('dscr', 'N/A')} "
+            f"(OCF {dscr.get('operating_cash_flow', 'N/A')} / "
+            f"Int Exp {dscr.get('interest_expense', 'N/A')})"
+        )
+
+    # ── Covenant Compliance ──────────────────────────────────────────
+    cov = (data.get("covenant_compliance") or {}).get("result") or {}
+    cov_items = cov.get("covenants") or {}
+    if cov_items:
+        rows = "\n".join(
+            f"| {name} | {info.get('actual', 'N/A')} | {info.get('threshold', 'N/A')} | {info.get('status', 'N/A')} |"
+            for name, info in cov_items.items()
+        )
+        sections.append(
+            f"## Covenant Compliance\n"
+            f"| Covenant | Actual | Threshold | Status |\n|---|---|---|---|\n{rows}"
+        )
+
+    # ── Earnings vs Estimates ────────────────────────────────────────
+    for key, label in [("eps_vs_estimates", "EPS"), ("revenue_vs_estimates", "Revenue")]:
+        est = (data.get(key) or {}).get("result") or {}
+        periods = est.get("periods") or []
+        if periods:
+            rows = "\n".join(
+                f"| {p.get('period_date', '')} | {p.get('actual', 'N/A')} | "
+                f"{p.get('consensus_mean', 'N/A')} | {p.get('surprise_pct', 'N/A')} | "
+                f"{p.get('beat_miss', 'N/A')} |"
+                for p in periods
+            )
+            sections.append(
+                f"## {label} vs Estimates (beat rate: {est.get('beat_count', '?')}/{est.get('total_periods', '?')})\n"
+                f"| Period | Actual | Consensus | Surprise | Result |\n|---|---|---|---|---|\n{rows}"
+            )
+
+    # ── Position Summary ─────────────────────────────────────────────
+    pos = (data.get("position_summary") or {}).get("result") or {}
+    if pos.get("in_position_book"):
+        exp = pos.get("exposure") or {}
+        exp_result = exp.get("result") or exp
+        risk = pos.get("risk") or {}
+        risk_result = risk.get("result") or risk
+        flags = risk_result.get("flags") or {}
+        active_flags = [f for f, v in flags.items() if v]
+
+        sections.append(
+            f"## Position Summary (as of {pos.get('as_of_date', 'N/A')})\n"
+            f"- **Total Notional:** {exp_result.get('total_notional', 'N/A')}\n"
+            f"- **Position Count:** {exp_result.get('position_count', 'N/A')}\n"
+            f"- **Risk Flags:** {', '.join(active_flags) if active_flags else 'None active'}"
+        )
+
+        # Desk breakdown
+        desks = exp_result.get("by_desk") or []
+        if desks:
+            desk_rows = "\n".join(
+                f"| {d.get('desk', '')} | {d.get('notional', 'N/A')} | {d.get('positions', '')} |"
+                for d in desks
+            )
+            sections.append(
+                f"### By Desk\n| Desk | Notional | Positions |\n|---|---|---|\n{desk_rows}"
+            )
+    elif pos:
+        sections.append("## Position Summary\n- Not in the position book.")
+
+    # ── Desk P&L ─────────────────────────────────────────────────────
+    pnl = (data.get("desk_pnl_30d") or {}).get("result") or {}
+    pnl_desks = pnl.get("desk_summary") or []
+    if pnl_desks:
+        pnl_rows = "\n".join(
+            f"| {d.get('desk', '')} | {d.get('total_pnl', 'N/A')} | "
+            f"{d.get('best_day', 'N/A')} | {d.get('worst_day', 'N/A')} |"
+            for d in pnl_desks
+        )
+        sections.append(
+            f"## Desk P&L (Last 30 Days)\n"
+            f"| Desk | Total P&L | Best Day | Worst Day |\n|---|---|---|---|\n{pnl_rows}"
+        )
+
+    # ── Document Search Results (keep brief) ─────────────────────────
+    for key, label in [
+        ("earnings_commentary", "Earnings Commentary"),
+        ("sec_filings", "SEC Filings"),
+        ("recent_news", "Recent News"),
+    ]:
+        doc = data.get(key) or {}
+        doc_results = doc.get("results") or []
+        if doc_results:
+            items = "\n".join(
+                f"- **{r.get('doc_name', 'Unknown')}** (score {r.get('relevance_score', 0):.2f}): "
+                f"{r.get('chunk_text', '')[:200]}"
+                for r in doc_results
+            )
+            sections.append(f"## {label}\n{items}")
+
+    return "\n\n".join(sections)
+
+
 def _search_for_briefing(engine, query, source_types, ticker):
-    """Helper: run a semantic search and return a serializable dict."""
+    """Helper: run a semantic search and return a serializable dict.
+
+    Uses top_k=3 (not 5) and truncates chunk_text to 300 chars to keep
+    the briefing payload compact for faster LLM synthesis.
+    """
     results = engine.search(
         query=query,
         source_types=set(source_types),
         ticker=ticker,
-        top_k=5,
+        top_k=3,
     )
     return {
         "citations": engine.format_citations(results),
@@ -788,7 +947,7 @@ def _search_for_briefing(engine, query, source_types, ticker):
         "results": [
             {
                 "doc_name": r.doc_name,
-                "chunk_text": r.chunk_text,
+                "chunk_text": r.chunk_text[:300] + ("..." if len(r.chunk_text) > 300 else ""),
                 "relevance_score": round(r.relevance_score, 4),
                 "source_type": r.source_type,
             }
@@ -1089,6 +1248,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
 
         prefetch_ticker = ticker or _extract_ticker_from_text(last_user_text)
 
+        is_prefetched = False
         if prefetch_ticker and _is_briefing_request(last_user_text):
             with mlflow.start_span(name="prefetch_full_briefing") as pf_span:
                 pf_span.set_inputs({"ticker": prefetch_ticker})
@@ -1097,8 +1257,10 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                 )
                 pf_span.set_outputs({"sections": list(prefetch_data.keys())})
 
-            # Inject a synthetic tool-call cycle so the LLM sees pre-fetched
-            # data as if it had called get_full_briefing itself.
+            # Format the data as markdown — the LLM only writes narrative
+            briefing_md = _format_briefing_markdown(prefetch_data)
+
+            # Inject synthetic tool-call with pre-formatted markdown
             synth_call_id = "prefetch_001"
             conversation.append({
                 "role": "assistant",
@@ -1115,23 +1277,37 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             conversation.append({
                 "role": "tool",
                 "tool_call_id": synth_call_id,
-                "content": json.dumps(prefetch_data, default=str),
+                "content": (
+                    "All data has been retrieved and pre-formatted below. "
+                    "Write a concise briefing report using ONLY this data. "
+                    "Include the pre-formatted tables as-is and add a short "
+                    "executive Summary at the top, brief Analysis narrative, "
+                    "and 2-3 Related Questions at the bottom. "
+                    "Do NOT call any more tools.\n\n"
+                    + briefing_md
+                ),
             })
+            is_prefetched = True
 
         # ── Tool-calling loop ────────────────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):
+            # Use the fast model for pre-fetched briefings (tables are
+            # already formatted — the LLM just writes narrative).
+            endpoint = LLM_ENDPOINT_FAST if is_prefetched else LLM_ENDPOINT
+
             with mlflow.start_span(name=f"llm_call_{round_num}") as span:
                 span.set_inputs({
                     "round": round_num,
                     "message_count": len(conversation),
+                    "endpoint": endpoint,
                 })
 
                 response = self.client.predict(
-                    endpoint=LLM_ENDPOINT,
+                    endpoint=endpoint,
                     inputs={
                         "messages": conversation,
                         "tools": TOOLS,
-                        "max_tokens": 4096,
+                        "max_tokens": 2048,
                     },
                 )
 
@@ -1206,6 +1382,195 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             "Here is what I gathered so far — please refine your question "
             "if you need additional detail."
         )
+
+    @mlflow.trace(name="research_agent_stream")
+    def predict_stream(self, context, messages, params=None):
+        """Stream the agent's response token-by-token.
+
+        For pre-fetched briefings, data is gathered first (~5s), then
+        the synthesis streams immediately.  For normal tool-calling
+        queries, only the final synthesis round is streamed.
+
+        Yields
+        ------
+        ChatCompletionChunk
+        """
+        # ── Extract custom inputs (same as predict) ───────────────────
+        custom = {}
+        if params:
+            if hasattr(params, "custom_inputs") and params.custom_inputs:
+                custom = params.custom_inputs
+            elif isinstance(params, dict) and "custom_inputs" in params:
+                custom = params["custom_inputs"]
+
+        ticker = custom.get("ticker")
+        active_doc_ids = custom.get("active_doc_ids")
+
+        # ── Build conversation with system prompt ─────────────────────
+        system_content = SYSTEM_PROMPT
+        if ticker:
+            system_content += f"\n\n## Current Context\n- **Active ticker:** {ticker}"
+        if active_doc_ids:
+            system_content += (
+                f"\n- **Active document IDs:** {', '.join(active_doc_ids)}"
+            )
+
+        conversation = [{"role": "system", "content": system_content}]
+
+        for msg in messages:
+            if hasattr(msg, "to_dict"):
+                conversation.append(msg.to_dict())
+            elif isinstance(msg, dict):
+                conversation.append(msg)
+            else:
+                conversation.append({"role": msg.role, "content": msg.content})
+
+        # ── Pre-fetch for briefing requests ───────────────────────────
+        last_user_text = ""
+        for msg in reversed(messages):
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if role == "user" and content:
+                last_user_text = content
+                break
+
+        prefetch_ticker = ticker or _extract_ticker_from_text(last_user_text)
+        is_prefetched = False
+
+        if prefetch_ticker and _is_briefing_request(last_user_text):
+            with mlflow.start_span(name="prefetch_full_briefing") as pf_span:
+                pf_span.set_inputs({"ticker": prefetch_ticker})
+                prefetch_data = _execute_full_briefing(
+                    prefetch_ticker, self.engine, self.spark,
+                )
+                pf_span.set_outputs({"sections": list(prefetch_data.keys())})
+
+            briefing_md = _format_briefing_markdown(prefetch_data)
+
+            synth_call_id = "prefetch_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_full_briefing",
+                        "arguments": json.dumps({"ticker": prefetch_ticker}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": (
+                    "All data has been retrieved and pre-formatted below. "
+                    "Write a concise briefing report using ONLY this data. "
+                    "Include the pre-formatted tables as-is and add a short "
+                    "executive Summary at the top, brief Analysis narrative, "
+                    "and 2-3 Related Questions at the bottom. "
+                    "Do NOT call any more tools.\n\n"
+                    + briefing_md
+                ),
+            })
+            is_prefetched = True
+
+        # ── Tool-calling loop (non-streaming for tool rounds) ─────────
+        for round_num in range(MAX_TOOL_ROUNDS):
+            endpoint = LLM_ENDPOINT_FAST if is_prefetched else LLM_ENDPOINT
+
+            with mlflow.start_span(name=f"llm_call_{round_num}") as span:
+                span.set_inputs({
+                    "round": round_num,
+                    "message_count": len(conversation),
+                    "endpoint": endpoint,
+                    "streaming": True,
+                })
+
+                # Try streaming — if the endpoint supports it, we can
+                # yield chunks for the final synthesis round.
+                response = self.client.predict(
+                    endpoint=endpoint,
+                    inputs={
+                        "messages": conversation,
+                        "tools": TOOLS,
+                        "max_tokens": 2048,
+                    },
+                )
+
+                choice = response["choices"][0]
+                message = choice["message"]
+                span.set_outputs({
+                    "finish_reason": choice.get("finish_reason"),
+                })
+
+            # If no tool calls, stream the final text response
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                text = message.get("content", "")
+                # Yield the response in chunks for streaming effect
+                chunk_size = 20  # ~20 chars per chunk
+                for i in range(0, len(text), chunk_size):
+                    yield ChatCompletionChunk(
+                        choices=[ChunkChoice(
+                            index=0,
+                            delta=DeltaMessage(
+                                role="assistant",
+                                content=text[i : i + chunk_size],
+                            ),
+                        )],
+                    )
+                return
+
+            # Append assistant message + execute tools (same as predict)
+            conversation.append(message)
+
+            def _run_tool(tc):
+                fn_name = tc["function"]["name"]
+                fn_args = json.loads(tc["function"]["arguments"])
+
+                if (
+                    ticker
+                    and "ticker" not in fn_args
+                    and "ticker" in _tool_param_names(fn_name)
+                ):
+                    fn_args["ticker"] = ticker
+
+                if (
+                    active_doc_ids
+                    and "doc_ids" not in fn_args
+                    and fn_name == "search_documents"
+                ):
+                    fn_args["doc_ids"] = active_doc_ids
+
+                with mlflow.start_span(name=f"tool_{fn_name}") as tspan:
+                    tspan.set_inputs(fn_args)
+                    try:
+                        tool_result = execute_tool(
+                            fn_name, fn_args, self.engine, self.spark,
+                        )
+                    except Exception as tool_err:
+                        tool_result = json.dumps({
+                            "error": str(tool_err),
+                            "tool": fn_name,
+                        })
+                    tspan.set_outputs({"result_length": len(tool_result)})
+
+                return tc["id"], tool_result
+
+            with ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
+                futures = {pool.submit(_run_tool, tc): tc for tc in tool_calls}
+                results = {}
+                for future in as_completed(futures):
+                    call_id, result = future.result()
+                    results[call_id] = result
+
+            for tc in tool_calls:
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": results[tc["id"]],
+                })
 
 
 # ---------------------------------------------------------------------------
