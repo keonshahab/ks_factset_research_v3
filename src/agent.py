@@ -708,10 +708,12 @@ TOOLS = [
 
 _BRIEFING_PATTERNS = [
     "full briefing", "full credit", "full equity", "full report",
+    "full summary", "full analysis",
     "complete analysis", "comprehensive",
     "tell me everything", "research report", "research briefing",
     "credit briefing", "equity briefing",
     "all in one report", "one report",
+    "credit and equity", "equity and credit",
 ]
 
 # Common English words that look like tickers but aren't

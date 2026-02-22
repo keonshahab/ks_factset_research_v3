@@ -96,6 +96,7 @@ from src.agent import (
     SYSTEM_PROMPT,
     TOOLS,
     LLM_ENDPOINT,
+    LLM_ENDPOINT_FAST,
     MAX_TOOL_ROUNDS,
 )
 
@@ -111,6 +112,7 @@ REGISTERED_MODEL_NAME = f"{CATALOG}.{SCHEMA}.research_agent"
 AGENT_MODULE_PATH = os.path.join(repo_root, "src", "agent.py")
 
 print(f"LLM endpoint:       {LLM_ENDPOINT}")
+print(f"LLM endpoint (fast):{LLM_ENDPOINT_FAST}")
 print(f"Agent endpoint:     {AGENT_ENDPOINT}")
 print(f"Registered model:   {REGISTERED_MODEL_NAME}")
 print(f"Max tool rounds:    {MAX_TOOL_ROUNDS}")
