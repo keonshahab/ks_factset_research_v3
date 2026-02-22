@@ -282,6 +282,7 @@ from mlflow.models.resources import (
 
 resources = [
     DatabricksServingEndpoint(endpoint_name="databricks-claude-sonnet-4-6"),
+    DatabricksServingEndpoint(endpoint_name="databricks-claude-haiku-4-5"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.filing_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.earnings_search_index"),
     DatabricksVectorSearchIndex(index_name="ks_factset_research_v3.demo.news_search_index"),
