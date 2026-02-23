@@ -557,6 +557,116 @@ def get_position_summary(spark, ticker: str) -> Dict[str, Any]:
     }
 
 
+def get_top_holdings(
+    spark,
+    top_n: int = 10,
+    desk: str | None = None,
+) -> Dict[str, Any]:
+    """Return the top N holdings across the entire portfolio by absolute notional.
+
+    Parameters
+    ----------
+    top_n : int
+        Number of holdings to return (default 10).
+    desk : str or None
+        Optional desk filter. If provided, only positions from this desk are
+        included.
+
+    Returns dict with keys: result, calculation_steps, sources.
+    """
+    steps = ["Querying portfolio-wide position data (no ticker filter)"]
+
+    # Find the most recent position date across the whole book
+    date_rows = _safe_query(spark, f"""
+        SELECT MAX(position_date) AS max_date
+        FROM {POSITIONS_TABLE}
+    """)
+    max_date = date_rows[0].get("max_date") if date_rows else None
+
+    if max_date is None:
+        return {
+            "result": {"message": "No position data found", "holdings": []},
+            "calculation_steps": steps + [f"No rows in {POSITIONS_TABLE}"],
+            "sources": [POSITIONS_TABLE],
+        }
+
+    as_of_date = str(max_date)
+    steps.append(f"Most recent position date: {as_of_date}")
+
+    desk_filter = f"AND desk = '{desk}'" if desk else ""
+    if desk:
+        steps.append(f"Filtering to desk: {desk}")
+
+    # Aggregate by ticker_region: sum notional across desks/books
+    holdings = _safe_query(spark, f"""
+        SELECT p.ticker_region,
+               SUM(p.notional)      AS total_notional,
+               SUM(p.market_value)  AS total_market_value,
+               COUNT(*)             AS position_count
+        FROM {POSITIONS_TABLE} p
+        WHERE p.position_date = '{as_of_date}'
+          {desk_filter}
+        GROUP BY p.ticker_region
+        ORDER BY ABS(SUM(p.notional)) DESC
+        LIMIT {top_n}
+    """)
+    steps.append(f"Retrieved top {len(holdings)} holdings by |notional|")
+
+    # Enrich: get desk list per ticker and short ticker names (best-effort)
+    ticker_map: Dict[str, str] = {}
+    desk_map: Dict[str, List[str]] = {}
+    if holdings:
+        tr_list = ", ".join(f"'{h['ticker_region']}'" for h in holdings)
+        # Short ticker lookup
+        ticker_rows = _safe_query(spark, f"""
+            SELECT ticker, ticker_region
+            FROM {DEMO_COMPANIES}
+            WHERE ticker_region IN ({tr_list})
+        """)
+        ticker_map = {r["ticker_region"]: r["ticker"] for r in ticker_rows}
+        # Desk membership per ticker
+        desk_rows = _safe_query(spark, f"""
+            SELECT ticker_region, desk
+            FROM {POSITIONS_TABLE}
+            WHERE position_date = '{as_of_date}'
+              AND ticker_region IN ({tr_list})
+              {desk_filter}
+            GROUP BY ticker_region, desk
+            ORDER BY ticker_region, desk
+        """)
+        for r in desk_rows:
+            desk_map.setdefault(r["ticker_region"], []).append(r["desk"])
+
+    formatted = []
+    for h in holdings:
+        tr = h["ticker_region"]
+        formatted.append({
+            "rank": len(formatted) + 1,
+            "ticker": ticker_map.get(tr, tr.split("-")[0]),
+            "ticker_region": tr,
+            "total_notional": _fmt(h["total_notional"]),
+            "total_notional_raw": h["total_notional"],
+            "total_market_value": _fmt(h["total_market_value"]),
+            "total_market_value_raw": h["total_market_value"],
+            "position_count": h["position_count"],
+            "desks": desk_map.get(tr, []),
+        })
+
+    total_book = sum(abs(h["total_notional"] or 0) for h in holdings)
+    steps.append(f"Total absolute notional across top {len(holdings)}: {_fmt(total_book)}")
+
+    return {
+        "result": {
+            "as_of_date": as_of_date,
+            "desk_filter": desk or "ALL",
+            "top_n": top_n,
+            "holdings": formatted,
+        },
+        "calculation_steps": steps,
+        "sources": [POSITIONS_TABLE, DEMO_COMPANIES],
+    }
+
+
 def get_desk_positions(
     spark,
     ticker: str,

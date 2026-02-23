@@ -47,6 +47,7 @@ from src.position_tools import (
     get_desk_pnl,
     get_risk_flags,
     get_position_summary,
+    get_top_holdings,
     get_desk_positions,
 )
 
@@ -257,6 +258,9 @@ attribution.
 - **Pro-forma leverage** — What-if with additional debt
 
 ### Position Tools
+- **Top holdings** — Top N holdings across the entire portfolio ranked by absolute \
+notional. Does NOT require a ticker — use this for portfolio-wide questions like \
+"what are my top 10 holdings", "biggest positions firm-wide", or "show me all holdings".
 - **Firm exposure** — Total notional, breakdowns by desk / asset class / book type
 - **Desk P&L** — Daily profit-and-loss by desk (last N trading days)
 - **Risk flags** — Volcker, restricted list, MNPI, concentration
@@ -294,6 +298,9 @@ separately — it returns both plus top positions in one call.
 
 ## Rules
 
+- **For portfolio-wide questions** (e.g., "top 10 holdings", "biggest positions", \
+"show me my portfolio", "what do we hold"), use `get_top_holdings`. This tool does \
+NOT require a ticker — it returns the top holdings across the entire book.
 - **Always proactively check positions** when answering research questions about a \
 ticker. Even if the user only asks about fundamentals, include a brief position \
 context section.
@@ -673,6 +680,32 @@ TOOLS = [
                     },
                 },
                 "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_holdings",
+            "description": (
+                "Top N holdings across the entire portfolio ranked by absolute "
+                "notional. Does NOT require a ticker — use this when the user asks "
+                "about overall portfolio holdings, biggest positions, or top "
+                "exposures firm-wide. Optionally filter by desk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of holdings to return (default 10).",
+                    },
+                    "desk": {
+                        "type": "string",
+                        "description": "Optional desk filter (e.g. 'Equity Trading'). Omit for all desks.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -1142,6 +1175,15 @@ def execute_tool(tool_name, arguments, engine, spark_session):
     elif tool_name == "get_position_summary":
         return json.dumps(
             get_position_summary(spark_session, arguments["ticker"]),
+            default=str,
+        )
+    elif tool_name == "get_top_holdings":
+        return json.dumps(
+            get_top_holdings(
+                spark_session,
+                top_n=arguments.get("top_n", 10),
+                desk=arguments.get("desk"),
+            ),
             default=str,
         )
     elif tool_name == "get_desk_positions":

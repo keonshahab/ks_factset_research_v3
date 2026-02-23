@@ -398,7 +398,8 @@ print(f"  Model Version: {model_info.registered_model_version}")
 # MAGIC
 # MAGIC The serving endpoint runs as a **system service principal** created by the
 # MAGIC Agent Framework.  This principal needs explicit Unity Catalog GRANT statements
-# MAGIC for the schemas and tables the agent queries.
+# MAGIC for the schemas and tables the agent queries, **plus write permissions for
+# MAGIC inference table logging** (`CREATE TABLE` + `MODIFY` on the gold schema).
 # MAGIC
 # MAGIC **Critical:** Permissions must be granted *while the endpoint is still starting*,
 # MAGIC not after it becomes Ready.  The platform's health-check calls `predict`,
@@ -477,6 +478,8 @@ def _grant_uc_permissions(principal):
         f"GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `{principal}`",
         f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
         f"GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
+        f"GRANT CREATE TABLE ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
+        f"GRANT MODIFY ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
         f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `{principal}`",
         f"GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `{principal}`",
         f"GRANT USE CATALOG ON CATALOG ks_position_sample TO `{principal}`",
@@ -566,6 +569,8 @@ if not _grants_applied:
             "GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `<PRINCIPAL>`;",
             "GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
             "GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
+            "GRANT CREATE TABLE ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
+            "GRANT MODIFY ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
             "GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;",
             "GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;",
             "GRANT USE CATALOG ON CATALOG ks_position_sample TO `<PRINCIPAL>`;",
