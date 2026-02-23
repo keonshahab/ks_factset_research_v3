@@ -1358,7 +1358,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                     inputs={
                         "messages": conversation,
                         "tools": TOOLS,
-                        "max_tokens": 2048,
+                        "max_tokens": 4096,
                     },
                 )
 
@@ -1547,7 +1547,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                     stream = self.openai_client.chat.completions.create(
                         model=ep,
                         messages=conv,
-                        max_tokens=2048,
+                        max_tokens=4096,
                         stream=True,
                     )
                     for chunk in stream:
@@ -1560,7 +1560,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             # Fallback: non-streaming call, split into word chunks
             resp = self.client.predict(
                 endpoint=ep,
-                inputs={"messages": conv, "max_tokens": 2048},
+                inputs={"messages": conv, "max_tokens": 4096},
             )
             text = resp["choices"][0]["message"].get("content", "")
             words = text.split(" ")
@@ -1584,7 +1584,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                     inputs={
                         "messages": conversation,
                         "tools": TOOLS,
-                        "max_tokens": 2048,
+                        "max_tokens": 4096,
                     },
                 )
 
