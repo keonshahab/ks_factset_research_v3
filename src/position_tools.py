@@ -602,8 +602,7 @@ def get_top_holdings(
         SELECT p.ticker_region,
                SUM(p.notional)      AS total_notional,
                SUM(p.market_value)  AS total_market_value,
-               COUNT(*)             AS position_count,
-               COLLECT_SET(p.desk)  AS desks
+               COUNT(*)             AS position_count
         FROM {POSITIONS_TABLE} p
         WHERE p.position_date = '{as_of_date}'
           {desk_filter}
@@ -613,16 +612,30 @@ def get_top_holdings(
     """)
     steps.append(f"Retrieved top {len(holdings)} holdings by |notional|")
 
-    # Enrich with short ticker from demo_companies (best-effort)
+    # Enrich: get desk list per ticker and short ticker names (best-effort)
     ticker_map: Dict[str, str] = {}
+    desk_map: Dict[str, List[str]] = {}
     if holdings:
         tr_list = ", ".join(f"'{h['ticker_region']}'" for h in holdings)
+        # Short ticker lookup
         ticker_rows = _safe_query(spark, f"""
             SELECT ticker, ticker_region
             FROM {DEMO_COMPANIES}
             WHERE ticker_region IN ({tr_list})
         """)
         ticker_map = {r["ticker_region"]: r["ticker"] for r in ticker_rows}
+        # Desk membership per ticker
+        desk_rows = _safe_query(spark, f"""
+            SELECT ticker_region, desk
+            FROM {POSITIONS_TABLE}
+            WHERE position_date = '{as_of_date}'
+              AND ticker_region IN ({tr_list})
+              {desk_filter}
+            GROUP BY ticker_region, desk
+            ORDER BY ticker_region, desk
+        """)
+        for r in desk_rows:
+            desk_map.setdefault(r["ticker_region"], []).append(r["desk"])
 
     formatted = []
     for h in holdings:
@@ -636,7 +649,7 @@ def get_top_holdings(
             "total_market_value": _fmt(h["total_market_value"]),
             "total_market_value_raw": h["total_market_value"],
             "position_count": h["position_count"],
-            "desks": h["desks"],
+            "desks": desk_map.get(tr, []),
         })
 
     total_book = sum(abs(h["total_notional"] or 0) for h in holdings)

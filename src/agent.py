@@ -258,6 +258,9 @@ attribution.
 - **Pro-forma leverage** — What-if with additional debt
 
 ### Position Tools
+- **Top holdings** — Top N holdings across the entire portfolio ranked by absolute \
+notional. Does NOT require a ticker — use this for portfolio-wide questions like \
+"what are my top 10 holdings", "biggest positions firm-wide", or "show me all holdings".
 - **Firm exposure** — Total notional, breakdowns by desk / asset class / book type
 - **Desk P&L** — Daily profit-and-loss by desk (last N trading days)
 - **Risk flags** — Volcker, restricted list, MNPI, concentration
@@ -295,6 +298,9 @@ separately — it returns both plus top positions in one call.
 
 ## Rules
 
+- **For portfolio-wide questions** (e.g., "top 10 holdings", "biggest positions", \
+"show me my portfolio", "what do we hold"), use `get_top_holdings`. This tool does \
+NOT require a ticker — it returns the top holdings across the entire book.
 - **Always proactively check positions** when answering research questions about a \
 ticker. Even if the user only asks about fundamentals, include a brief position \
 context section.
