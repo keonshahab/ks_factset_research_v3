@@ -364,129 +364,197 @@ print(f"  Model Version: {model_info.registered_model_version}")
 
 # MAGIC %md
 # MAGIC ---
-# MAGIC ## Step 5.5: Grant UC Permissions to Serving Endpoint
+# MAGIC ## Step 5.5: Grant UC Permissions & Wait for Endpoint Ready
 # MAGIC
 # MAGIC The serving endpoint runs as a **system service principal** created by the
-# MAGIC Agent Framework.  This principal can authenticate to the SQL warehouse
-# MAGIC (because we declared `DatabricksSQLWarehouse` as a resource), but it still
-# MAGIC needs explicit Unity Catalog GRANT statements for the schemas and tables
-# MAGIC the agent queries:
+# MAGIC Agent Framework.  This principal needs explicit Unity Catalog GRANT statements
+# MAGIC for the schemas and tables the agent queries.
 # MAGIC
-# MAGIC | Catalog | Schema | Tables |
-# MAGIC |---------|--------|--------|
-# MAGIC | `ks_factset_research_v3` | `gold` | company_profile, company_financials, consensus_estimates, position_exposures, position_pnl, position_risk_flags, demo_companies |
-# MAGIC | `ks_position_sample` | `vendor_data` | factset_symbology_xref |
+# MAGIC **Critical:** Permissions must be granted *while the endpoint is still starting*,
+# MAGIC not after it becomes Ready.  The platform's health-check calls `predict`,
+# MAGIC which triggers tool calls that need UC access.  If permissions aren't in place,
+# MAGIC the health-check fails and the endpoint stays stuck in "Creating" forever.
 # MAGIC
-# MAGIC This step discovers the service principal and runs the GRANTs automatically.
+# MAGIC **Strategy:** Poll the endpoint's container logs for the `current_user=<uuid>`
+# MAGIC printed by `_SQLWarehouseProxy.__init__`, grant permissions immediately,
+# MAGIC then continue waiting for the endpoint to reach READY.
 
 # COMMAND ----------
 
 import re
 import time as _time
+from databricks.sdk import WorkspaceClient
 
+_w = WorkspaceClient()
 deploy_client = get_deploy_client("databricks")
 
-# ── Wait for the endpoint to accept requests ─────────────────────────
-print(f"Waiting for endpoint '{AGENT_ENDPOINT}' to start...")
-_endpoint_ready = False
-for _attempt in range(30):
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def _get_served_model_name():
+    """Extract the served model/entity name from the endpoint config."""
     try:
-        deploy_client.predict(
-            endpoint=AGENT_ENDPOINT,
-            inputs={"messages": [{"role": "user", "content": "hello"}]},
-        )
-        _endpoint_ready = True
-        break
-    except Exception as _e:
-        _err = str(_e)
-        # If we get an actual application error (permissions, etc.) the
-        # endpoint IS running — it just can't access the data yet.
-        if any(k in _err for k in ("INSUFFICIENT_PERMISSIONS", "current_user=", "SQL warehouse query failed")):
-            _endpoint_ready = True
-            break
-        _time.sleep(10)
-
-if not _endpoint_ready:
-    print("WARNING: endpoint may not be ready yet. Continuing with grants anyway.\n")
-
-# ── Discover the serving principal ────────────────────────────────────
-# Use the agent's built-in diagnostic: send "__DIAGNOSTIC_IDENTITY__" and
-# it returns "SERVING_IDENTITY=<principal>" directly from SELECT current_user().
-# This bypasses the LLM so we get the raw system service principal UUID.
-serving_principal = None
-
-print("Querying endpoint for serving identity ...")
-try:
-    _diag = deploy_client.predict(
-        endpoint=AGENT_ENDPOINT,
-        inputs={
-            "messages": [{"role": "user", "content": "__DIAGNOSTIC_IDENTITY__"}],
-        },
-    )
-    _diag_content = str(_diag)
-    _match = re.search(r"SERVING_IDENTITY=(\S+)", _diag_content)
-    if _match and _match.group(1) not in ("UNKNOWN", "ERROR:"):
-        serving_principal = _match.group(1)
-        print(f"Discovered serving principal: {serving_principal}")
-    else:
-        print(f"Diagnostic returned: {_diag_content[:300]}")
-except Exception as _e:
-    print(f"Diagnostic call failed: {str(_e)[:300]}")
-
-# ── Fallback: check endpoint build logs for current_user= ─────────────
-if serving_principal is None:
-    print("Checking endpoint logs for serving identity ...")
-    try:
-        from databricks.sdk import WorkspaceClient
-        _w = WorkspaceClient()
         _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
-        # Search build logs for the current_user logged by _SQLWarehouseProxy
-        _logs = getattr(_ep, "pending_config", None) or _ep.config
-        _logs_str = str(_logs)
-        _log_match = re.search(r"current_user=([0-9a-f-]{36})", _logs_str)
-        if _log_match:
-            serving_principal = _log_match.group(1)
-            print(f"Discovered serving principal from endpoint config: {serving_principal}")
-    except Exception as _sdk_err:
-        print(f"  SDK lookup failed: {_sdk_err}")
+        for _cfg in [getattr(_ep, "pending_config", None), _ep.config]:
+            if _cfg and getattr(_cfg, "served_entities", None):
+                return _cfg.served_entities[0].name
+            if _cfg and getattr(_cfg, "served_models", None):
+                return _cfg.served_models[0].model_name
+    except Exception:
+        pass
+    return None
 
-if serving_principal is None:
-    print("WARNING: Could not discover serving principal automatically.")
-    print("Check endpoint Logs tab for 'current_user=' and set serving_principal manually.")
 
-# ── Run the GRANT statements ─────────────────────────────────────────
-if serving_principal:
-    print(f"\nGranting UC permissions to: {serving_principal}\n")
+def _discover_principal_from_logs():
+    """Scrape container logs for current_user=<uuid> printed by _SQLWarehouseProxy."""
+    _sm_name = _get_served_model_name()
+    if not _sm_name:
+        return None
+    try:
+        _logs_resp = _w.serving_endpoints.logs(
+            name=AGENT_ENDPOINT,
+            served_model_name=_sm_name,
+        )
+        _logs_text = getattr(_logs_resp, "logs", "") or str(_logs_resp)
+        _match = re.search(r"current_user=([0-9a-f-]{36})", _logs_text)
+        if _match:
+            return _match.group(1)
+    except Exception:
+        pass
+    return None
 
+
+def _discover_principal_from_diagnostic():
+    """Send __DIAGNOSTIC_IDENTITY__ and parse SERVING_IDENTITY from the response."""
+    try:
+        _diag = deploy_client.predict(
+            endpoint=AGENT_ENDPOINT,
+            inputs={
+                "messages": [{"role": "user", "content": "__DIAGNOSTIC_IDENTITY__"}],
+            },
+        )
+        _diag_str = str(_diag)
+        _match = re.search(r"SERVING_IDENTITY=(\S+)", _diag_str)
+        if _match and _match.group(1) not in ("UNKNOWN", "ERROR:"):
+            return _match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _grant_uc_permissions(principal):
+    """Run all required GRANT statements for the serving principal."""
     _grants = [
-        # ── ks_factset_research_v3.gold (financial + position tables) ──
-        f"GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `{serving_principal}`",
-        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `{serving_principal}`",
-        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `{serving_principal}`",
-        # ── ks_factset_research_v3.demo (vector search source tables) ──
-        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `{serving_principal}`",
-        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `{serving_principal}`",
-        # ── ks_position_sample.vendor_data (ticker crosswalk) ──
-        f"GRANT USE CATALOG ON CATALOG ks_position_sample TO `{serving_principal}`",
-        f"GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `{serving_principal}`",
-        f"GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `{serving_principal}`",
+        f"GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `{principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
+        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `{principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `{principal}`",
+        f"GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `{principal}`",
+        f"GRANT USE CATALOG ON CATALOG ks_position_sample TO `{principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `{principal}`",
+        f"GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `{principal}`",
     ]
-
     for _stmt in _grants:
         try:
             spark.sql(_stmt)
-            print(f"  OK  {_stmt}")
+            print(f"    OK  {_stmt}")
         except Exception as _ge:
-            err_str = str(_ge)
-            if "already" in err_str.lower():
-                print(f"  SKIP {_stmt}  (already granted)")
+            _err = str(_ge)
+            if "already" in _err.lower():
+                print(f"    SKIP {_stmt}  (already granted)")
             else:
-                print(f"  WARN {_stmt}")
-                print(f"       -> {err_str[:200]}")
+                print(f"    WARN {_stmt}")
+                print(f"         -> {_err[:200]}")
 
-    print("\nUC permissions granted. Testing endpoint ...\n")
+# ── Main polling loop ─────────────────────────────────────────────────
+# Poll endpoint state via SDK.  As soon as we discover the service
+# principal from the container logs, grant UC permissions so the
+# health-check predict call can succeed and the endpoint can finish
+# transitioning to READY.
 
-    # Quick verification
+serving_principal = None
+_grants_applied = False
+
+print(f"Polling endpoint '{AGENT_ENDPOINT}' ...")
+print("  Will grant UC permissions as soon as the service principal is discovered.\n")
+
+for _attempt in range(90):  # up to ~15 min
+    # ── 1. Check endpoint state ──────────────────────────────────────
+    try:
+        _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
+        _state = _ep.state
+        _ready = str(getattr(_state, "ready", "")) if _state else ""
+        _config_update = str(getattr(_state, "config_update", "")) if _state else ""
+    except Exception as _e:
+        print(f"  [{_attempt+1:02d}] SDK poll error: {_e}")
+        _time.sleep(10)
+        continue
+
+    # ── 2. If READY, we're done ──────────────────────────────────────
+    if "READY" in _ready:
+        print(f"  [{_attempt+1:02d}] Endpoint is READY!")
+        break
+
+    # ── 3. Try to discover principal & grant permissions ─────────────
+    if not _grants_applied:
+        # Method A: container logs (available once the container starts)
+        if not serving_principal:
+            serving_principal = _discover_principal_from_logs()
+            if serving_principal:
+                print(f"  [{_attempt+1:02d}] Discovered principal from container logs: {serving_principal}")
+
+        # Method B: diagnostic predict (only works if endpoint accepts requests)
+        if not serving_principal and _attempt >= 12:
+            serving_principal = _discover_principal_from_diagnostic()
+            if serving_principal:
+                print(f"  [{_attempt+1:02d}] Discovered principal from diagnostic call: {serving_principal}")
+
+        # Grant as soon as we have the identity
+        if serving_principal and not _grants_applied:
+            print(f"\n  Granting UC permissions to {serving_principal} ...")
+            _grant_uc_permissions(serving_principal)
+            _grants_applied = True
+            print("  Permissions granted — endpoint health-check should pass now.\n")
+
+    print(f"  [{_attempt+1:02d}] ready={_ready}, config_update={_config_update}, grants={'applied' if _grants_applied else 'pending'}")
+    _time.sleep(10)
+
+else:
+    print(f"\n  WARNING: Endpoint did not reach READY within 15 minutes.")
+    print("  Check the Serving UI → Events and Logs tabs for errors.")
+
+# ── Post-loop: handle cases where principal was never found ───────────
+if not _grants_applied:
+    if not serving_principal:
+        print("\n" + "=" * 70)
+        print("MANUAL STEP REQUIRED — Grant UC permissions")
+        print("=" * 70)
+        print()
+        print("Could not auto-discover the serving principal.")
+        print("Go to Serving endpoint → Logs tab, search for 'current_user='")
+        print("to find the service principal UUID, then run:\n")
+        _manual_grants = [
+            "GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `<PRINCIPAL>`;",
+            "GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
+            "GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;",
+            "GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;",
+            "GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;",
+            "GRANT USE CATALOG ON CATALOG ks_position_sample TO `<PRINCIPAL>`;",
+            "GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `<PRINCIPAL>`;",
+            "GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `<PRINCIPAL>`;",
+        ]
+        for _g in _manual_grants:
+            print(f"  {_g}")
+        print()
+    else:
+        # We found the principal but grants somehow weren't applied
+        print(f"\nApplying grants now for {serving_principal} ...")
+        _grant_uc_permissions(serving_principal)
+        _grants_applied = True
+
+# ── Quick verification ────────────────────────────────────────────────
+if _grants_applied:
+    print("\nVerifying endpoint with a test query ...")
+    _time.sleep(5)  # brief pause for grants to propagate
     try:
         _verify = deploy_client.predict(
             endpoint=AGENT_ENDPOINT,
@@ -497,33 +565,14 @@ if serving_principal:
         )
         _content = _verify.get("choices", [{}])[0].get("message", {}).get("content", "")
         if any(k in _content for k in ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS")):
-            print(f"Verification FAILED — still seeing permissions errors")
+            print(f"  Verification FAILED — still seeing permissions errors")
             print(f"  Preview: {_content[:300]}")
         else:
-            print(f"Verification PASSED — response length: {len(_content):,} chars")
+            print(f"  Verification PASSED — response length: {len(_content):,} chars")
             print(f"  Preview: {_content[:200]}...")
     except Exception as _ve:
-        print(f"Verification call failed: {_ve}")
-        print("The grants may need a few seconds to propagate. Try the Playground shortly.")
-
-else:
-    print("\n" + "=" * 70)
-    print("MANUAL STEP REQUIRED — Grant UC permissions")
-    print("=" * 70)
-    print()
-    print("Could not auto-discover the serving principal.")
-    print("Go to the Serving endpoint → Logs tab and look for")
-    print("'current_user=' to find the identity, then run:")
-    print()
-    print("  GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `<PRINCIPAL>`;")
-    print("  GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;")
-    print("  GRANT SELECT ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;")
-    print("  GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;")
-    print("  GRANT SELECT ON SCHEMA ks_factset_research_v3.demo TO `<PRINCIPAL>`;")
-    print("  GRANT USE CATALOG ON CATALOG ks_position_sample TO `<PRINCIPAL>`;")
-    print("  GRANT USE SCHEMA ON SCHEMA ks_position_sample.vendor_data TO `<PRINCIPAL>`;")
-    print("  GRANT SELECT ON TABLE ks_position_sample.vendor_data.factset_symbology_xref TO `<PRINCIPAL>`;")
-    print()
+        print(f"  Verification call failed: {_ve}")
+        print("  Grants may need a few seconds to propagate. Try the Playground shortly.")
 
 # COMMAND ----------
 
