@@ -409,94 +409,52 @@ if not _endpoint_ready:
     print("WARNING: endpoint may not be ready yet. Continuing with grants anyway.\n")
 
 # ── Discover the serving principal ────────────────────────────────────
-# The agent's _SQLWarehouseProxy embeds `current_user=` in error messages.
-# We force a SQL-dependent tool call (Debt/Equity) so that INSUFFICIENT_PERMISSIONS
-# errors surface even when the endpoint returns HTTP 200.
+# The agent has a built-in diagnostic: send "__DIAGNOSTIC_IDENTITY__" and
+# it returns "SERVING_IDENTITY=<principal>" directly from SELECT current_user().
+# This bypasses the LLM entirely so we get the raw service principal name.
 serving_principal = None
 
-# This question forces calculate_leverage_ratio → hits gold schema via SQL.
-_discovery_msg = "What is the Debt/Equity ratio for NVDA?"
+print("Querying endpoint for serving identity ...")
 try:
-    _test = deploy_client.predict(
+    _diag = deploy_client.predict(
         endpoint=AGENT_ENDPOINT,
         inputs={
-            "messages": [{"role": "user", "content": _discovery_msg}],
-            "custom_inputs": {"ticker": "NVDA"},
+            "messages": [{"role": "user", "content": "__DIAGNOSTIC_IDENTITY__"}],
         },
     )
-    _resp_content = str(_test)
-    # Check for permission errors in the response body (endpoint returns 200
-    # even when tools fail internally — the LLM just reports the error).
-    _match = re.search(r"current_user='([^']+)'", _resp_content)
-    if _match:
-        serving_principal = _match.group(1)
-        print(f"Discovered serving principal from response: {serving_principal}")
-        # Check if the response also contains real data despite the error
-        if "INSUFFICIENT_PERMISSIONS" not in _resp_content:
-            print("  (Permissions appear OK — will verify after grants.)")
-    elif "INSUFFICIENT_PERMISSIONS" in _resp_content:
-        print("Endpoint has permission errors but could not extract principal.")
-        print("  Falling back to SDK lookup ...")
-    else:
-        # Verify the response actually used SQL tools, not just
-        # the LLM's training knowledge (which can mention "leverage" etc.)
-        _perm_errors = ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS", "permission", "Permission error")
-        _has_perm_error = any(k in _resp_content for k in _perm_errors)
-        _used_live_data = any(k in _resp_content for k in ("Debt/Equity", "debt_to_equity")) and not _has_perm_error
-        if _used_live_data:
-            print("Endpoint responded with live financial data — UC permissions are already granted.")
-            serving_principal = "__ALREADY_GRANTED__"
-        else:
-            print("Endpoint responded but unclear if SQL tools worked. Running grants to be safe ...")
-            print("  Falling back to SDK lookup ...")
-except Exception as _e:
-    _err_msg = str(_e)
-    _match = re.search(r"current_user='([^']+)'", _err_msg)
-    if _match:
+    _diag_content = str(_diag)
+    _match = re.search(r"SERVING_IDENTITY=(\S+)", _diag_content)
+    if _match and _match.group(1) not in ("UNKNOWN", "ERROR:"):
         serving_principal = _match.group(1)
         print(f"Discovered serving principal: {serving_principal}")
     else:
-        print("Could not auto-discover the serving principal from the error message.")
-        print(f"  Error snippet: {_err_msg[:300]}")
-        print()
-        print("Falling back to querying the serving endpoint permissions ...")
+        print(f"Diagnostic returned: {_diag_content[:300]}")
+        print("Falling back to SDK lookup ...")
+except Exception as _e:
+    print(f"Diagnostic call failed: {str(_e)[:300]}")
+    print("Falling back to SDK lookup ...")
 
-# ── Fallback: look up the service principal from the endpoint config ──
+# ── Fallback: SDK-based principal discovery ───────────────────────────
 if serving_principal is None:
     try:
         from databricks.sdk import WorkspaceClient
         _w = WorkspaceClient()
         _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
 
-        # Method 1: Check served_entities for environment_vars or owner info
-        for _entity in (_ep.config.served_entities or []):
-            _entity_str = str(_entity)
-            # Some Agent Framework endpoints embed the SP name in env vars
-            _sp_match = re.search(r"service.principal[._]?(?:name)?['\"]?\s*[:=]\s*['\"]?([^'\"}\s,]+)", _entity_str, re.IGNORECASE)
-            if _sp_match:
-                serving_principal = _sp_match.group(1)
-                print(f"Discovered serving principal from served_entities: {serving_principal}")
+        # Check endpoint ACL for a service principal
+        _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
+        for _acl in (_perms.access_control_list or []):
+            _sp = getattr(_acl, "service_principal_name", None)
+            if _sp:
+                serving_principal = _sp
+                print(f"Discovered serving principal from endpoint ACL: {serving_principal}")
                 break
-
-        # Method 2: Check endpoint ACL for a service principal
-        if serving_principal is None:
-            _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
-            for _acl in (_perms.access_control_list or []):
-                if getattr(_acl, "service_principal_name", None):
-                    serving_principal = _acl.service_principal_name
-                    print(f"Discovered serving principal from endpoint ACL: {serving_principal}")
-                    break
-
-        # Method 3: Use the endpoint creator/owner as a last resort
-        if serving_principal is None and getattr(_ep, "creator", None):
-            serving_principal = _ep.creator
-            print(f"Using endpoint creator as principal: {serving_principal}")
 
     except Exception as _sdk_err:
         print(f"  SDK lookup failed: {_sdk_err}")
 
 # ── Run the GRANT statements ─────────────────────────────────────────
-if serving_principal and serving_principal != "__ALREADY_GRANTED__":
+if serving_principal:
     print(f"\nGranting UC permissions to: {serving_principal}\n")
 
     _grants = [
@@ -519,16 +477,15 @@ if serving_principal and serving_principal != "__ALREADY_GRANTED__":
             print(f"  OK  {_stmt}")
         except Exception as _ge:
             err_str = str(_ge)
-            # Ignore "already granted" or "already has" style messages
             if "already" in err_str.lower():
                 print(f"  SKIP {_stmt}  (already granted)")
             else:
                 print(f"  WARN {_stmt}")
                 print(f"       -> {err_str[:200]}")
 
-    print("\nUC permissions granted. Testing endpoint again ...\n")
+    print("\nUC permissions granted. Testing endpoint ...\n")
 
-    # Quick verification — use a SQL-forcing question to confirm grants work
+    # Quick verification
     try:
         _verify = deploy_client.predict(
             endpoint=AGENT_ENDPOINT,
@@ -538,24 +495,24 @@ if serving_principal and serving_principal != "__ALREADY_GRANTED__":
             },
         )
         _content = _verify.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if any(k in _content for k in ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS", "permissions error", "Permission error")):
-            print(f"Verification FAILED — still seeing INSUFFICIENT_PERMISSIONS")
+        if any(k in _content for k in ("INSUFFICIENT_PRIVILEGES", "INSUFFICIENT_PERMISSIONS")):
+            print(f"Verification FAILED — still seeing permissions errors")
             print(f"  Preview: {_content[:300]}")
         else:
             print(f"Verification PASSED — response length: {len(_content):,} chars")
             print(f"  Preview: {_content[:200]}...")
     except Exception as _ve:
-        print(f"Verification failed: {_ve}")
-        print("The grants may need a few seconds to propagate. Try the Playground again shortly.")
+        print(f"Verification call failed: {_ve}")
+        print("The grants may need a few seconds to propagate. Try the Playground shortly.")
 
-elif serving_principal != "__ALREADY_GRANTED__":
+else:
     print("\n" + "=" * 70)
     print("MANUAL STEP REQUIRED — Grant UC permissions")
     print("=" * 70)
     print()
-    print("Run these SQL commands in a notebook or SQL editor, replacing")
-    print("<PRINCIPAL> with the serving endpoint's identity.")
-    print("(Check the endpoint Logs tab for 'current_user=' to find it.)")
+    print("Could not auto-discover the serving principal.")
+    print("Go to the Serving endpoint → Logs tab and look for")
+    print("'current_user=' to find the identity, then run:")
     print()
     print("  GRANT USE CATALOG ON CATALOG ks_factset_research_v3 TO `<PRINCIPAL>`;")
     print("  GRANT USE SCHEMA ON SCHEMA ks_factset_research_v3.gold TO `<PRINCIPAL>`;")
@@ -694,7 +651,6 @@ print("  • Pre-fetch detection: 'full briefing' requests bypass first LLM call
 print("  • Dual-model routing: Haiku for briefing synthesis, Sonnet for tool-calling")
 print("  • Pre-formatted markdown: structured data rendered as tables before LLM")
 print("  • Parallel vector search: 3 indexes queried concurrently")
-print("  • Streaming: predict_stream() yields chunks for faster time-to-first-token")
 print()
 print("System prompt includes:")
 print("  • Document index descriptions (filings, earnings, news)")
