@@ -120,12 +120,25 @@ class CitationEngine:
 
         self._vsc = VectorSearchClient()
 
-        # Eagerly resolve index handles so connection errors surface early
-        self._indexes = {
-            FILINGS: self._vsc.get_index(self.endpoint_name, self.filing_index),
-            EARNINGS: self._vsc.get_index(self.endpoint_name, self.earnings_index),
-            NEWS: self._vsc.get_index(self.endpoint_name, self.news_index),
+        # Resolve index handles — retry once if the first attempt fails
+        # (e.g. transient auth issue during Model Serving cold start).
+        self._indexes = {}
+        _index_map = {
+            FILINGS: self.filing_index,
+            EARNINGS: self.earnings_index,
+            NEWS: self.news_index,
         }
+        for source_type, index_name in _index_map.items():
+            try:
+                self._indexes[source_type] = self._vsc.get_index(
+                    self.endpoint_name, index_name,
+                )
+            except Exception:
+                import time
+                time.sleep(2)
+                self._indexes[source_type] = self._vsc.get_index(
+                    self.endpoint_name, index_name,
+                )
 
     # -----------------------------------------------------------------------
     # Public API
