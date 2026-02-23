@@ -164,33 +164,38 @@ class _SQLWarehouseProxy:
         # Verify connectivity and log the actual identity so we know
         # exactly who to grant UC permissions to.  Store the identity
         # so it can be included in query-time error messages.
+        # NOTE: This is best-effort — if the warehouse is stopped and
+        # needs to wake up, we log a warning and proceed.  The first
+        # real query will trigger the wake-up instead.
         self._current_user = "UNKNOWN"
         self._session_user = "UNKNOWN"
-        conn = self._new_connection()
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT current_user() AS current_user, session_user() AS session_user")
-            row = cur.fetchone()
-            cur.close()
-            self._current_user = row[0] if row else "UNKNOWN"
-            self._session_user = row[1] if row and len(row) > 1 else "UNKNOWN"
-            logger.warning(
-                "_SQLWarehouseProxy: connection test passed. "
-                "current_user=%s, session_user=%s",
-                self._current_user,
-                self._session_user,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"_SQLWarehouseProxy: connection test failed. "
-                f"host={self._host!r}, http_path={self._http_path!r}, "
-                f"auth_type={self._cfg.auth_type}, error={e}"
-            ) from e
-        finally:
+            conn = self._new_connection()
             try:
-                conn.close()
-            except Exception:
-                pass
+                cur = conn.cursor()
+                cur.execute("SELECT current_user() AS current_user, session_user() AS session_user")
+                row = cur.fetchone()
+                cur.close()
+                self._current_user = row[0] if row else "UNKNOWN"
+                self._session_user = row[1] if row and len(row) > 1 else "UNKNOWN"
+                logger.warning(
+                    "_SQLWarehouseProxy: connection test passed. "
+                    "current_user=%s, session_user=%s",
+                    self._current_user,
+                    self._session_user,
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(
+                "_SQLWarehouseProxy: connection test failed (non-fatal, "
+                "will retry on first query). host=%r, http_path=%r, "
+                "auth_type=%s, error=%s",
+                self._host, self._http_path, self._cfg.auth_type, e,
+            )
 
     def _new_connection(self):
         """Create a fresh connection with current credentials."""
@@ -1164,7 +1169,15 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
         Serving (no JVM) we fall back to a lightweight SQL warehouse proxy
         that uses ``databricks-sql-connector`` over HTTP.
         """
+        import logging
+
+        logger = logging.getLogger("FactSetResearchAgent")
+        logger.warning("load_context: starting initialization ...")
+
+        logger.warning("load_context: creating deploy client ...")
         self.client = get_deploy_client("databricks")
+
+        logger.warning("load_context: creating CitationEngine ...")
         self.engine = CitationEngine()
 
         # Use the active SparkSession if running on a Databricks cluster
@@ -1174,6 +1187,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
         # NOTE: Do NOT use getOrCreate() — in Model Serving it can create
         # a local Spark session (if pyspark is installed) that cannot
         # access Unity Catalog tables.
+        logger.warning("load_context: setting up SQL backend ...")
         try:
             from pyspark.sql import SparkSession
 
@@ -1181,8 +1195,12 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             if spark is None:
                 raise RuntimeError("No active Spark session")
             self.spark = spark
+            logger.warning("load_context: using active SparkSession")
         except Exception:
             self.spark = _SQLWarehouseProxy(WAREHOUSE_ID)
+            logger.warning("load_context: using _SQLWarehouseProxy")
+
+        logger.warning("load_context: initialization complete.")
 
     @mlflow.trace(name="research_agent")
     def predict(self, context, messages, params=None):
