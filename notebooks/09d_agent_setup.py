@@ -348,6 +348,36 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
 # COMMAND ----------
 
 from databricks.agents import deploy
+from databricks.sdk import WorkspaceClient as _WC
+
+# ── Guard: abort if there is already an in-progress deployment ────────
+# Calling deploy() while a previous config update is still pending
+# replaces the entire endpoint config and restarts ALL served entities,
+# putting every version back into "Creating".  Wait for the previous
+# deployment to finish (or delete the endpoint) before re-deploying.
+
+_guard_client = _WC()
+try:
+    _existing_ep = _guard_client.serving_endpoints.get(name=AGENT_ENDPOINT)
+    _cfg_update = (
+        str(getattr(_existing_ep.state, "config_update", ""))
+        if _existing_ep.state else ""
+    )
+    if "IN_PROGRESS" in _cfg_update or "NOT_READY" in _cfg_update:
+        raise RuntimeError(
+            f"Endpoint '{AGENT_ENDPOINT}' already has a deployment in progress "
+            f"(state.config_update={_cfg_update}). "
+            f"Wait for it to finish or delete the endpoint before re-deploying."
+        )
+    print(f"Endpoint '{AGENT_ENDPOINT}' exists, no in-progress update — safe to deploy.")
+except Exception as _guard_err:
+    if "RESOURCE_DOES_NOT_EXIST" in str(_guard_err) or "not found" in str(_guard_err).lower():
+        print(f"Endpoint '{AGENT_ENDPOINT}' does not exist yet — will create.")
+    elif isinstance(_guard_err, RuntimeError):
+        raise  # re-raise our own guard error
+    else:
+        print(f"Guard check warning: {_guard_err}")
+        print("Proceeding with deploy anyway.\n")
 
 deployment = deploy(
     model_name=REGISTERED_MODEL_NAME,
