@@ -608,6 +608,127 @@ if _grants_applied:
 
 # MAGIC %md
 # MAGIC ---
+# MAGIC ## Step 5.6: Grant Trace-Logging Permissions
+# MAGIC
+# MAGIC The serving endpoint's service principal also needs workspace-level
+# MAGIC permissions to write MLflow traces.  Without this, traces silently
+# MAGIC fail with `PERMISSION_DENIED` on the backing notebook/experiment.
+# MAGIC
+# MAGIC This cell reuses the `serving_principal` discovered in Step 5.5.
+# MAGIC If it wasn't found there, it re-discovers it from the container logs.
+
+# COMMAND ----------
+
+import re as _re
+from databricks.sdk import WorkspaceClient as _WSC
+from databricks.sdk.service.iam import ObjectPermissions
+
+_w2 = _WSC()
+
+# ── Re-discover principal if Step 5.5 didn't find it ──────────────────
+_trace_principal = globals().get("serving_principal")
+
+if not _trace_principal:
+    print("serving_principal not set from Step 5.5, re-discovering from logs ...")
+    try:
+        _ep2 = _w2.serving_endpoints.get(name=AGENT_ENDPOINT)
+        _sm2 = None
+        for _cfg2 in [getattr(_ep2, "pending_config", None), _ep2.config]:
+            if _cfg2 and getattr(_cfg2, "served_entities", None):
+                _sm2 = _cfg2.served_entities[0].name
+                break
+            if _cfg2 and getattr(_cfg2, "served_models", None):
+                _sm2 = _cfg2.served_models[0].model_name
+                break
+        if _sm2:
+            _logs2 = _w2.serving_endpoints.logs(name=AGENT_ENDPOINT, served_model_name=_sm2)
+            _logs_text2 = getattr(_logs2, "logs", "") or str(_logs2)
+            _match2 = _re.search(r"current_user=([0-9a-f-]{36})", _logs_text2)
+            if _match2:
+                _trace_principal = _match2.group(1)
+    except Exception as _e2:
+        print(f"  Log scrape failed: {_e2}")
+
+if not _trace_principal:
+    print("ERROR: Could not discover service principal.")
+    print("Skipping trace permission grants. Traces will not be logged.")
+    print("You can manually grant permissions later using the service principal UUID.")
+else:
+    print(f"Service principal: {_trace_principal}")
+
+    # ── 1. Grant permission on the MLflow experiment ──────────────────
+    #    The model's experiment is where traces are logged by default.
+    _experiment_path = f"/Users/{dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()}"
+    _granted_items = []
+
+    # Try to find and grant on the model's experiment
+    try:
+        _exp = mlflow.get_experiment_by_name(f"/{REGISTERED_MODEL_NAME}")
+        if _exp is None:
+            _exp = mlflow.get_experiment_by_name(_experiment_path)
+        if _exp:
+            _w2.permissions.update(
+                "experiments",
+                _exp.experiment_id,
+                access_control_list=[
+                    {
+                        "service_principal_name": _trace_principal,
+                        "permission_level": "CAN_MANAGE",
+                    }
+                ],
+            )
+            _granted_items.append(f"experiment {_exp.experiment_id}")
+    except Exception as _exp_err:
+        print(f"  WARN: Could not grant experiment permission: {_exp_err}")
+
+    # ── 2. Grant CAN_RUN on the backing notebook if we know its ID ────
+    #    The trace error referenced notebook ID 25844095406540
+    try:
+        # Try the known notebook ID from the error logs
+        _notebook_ids = ["25844095406540"]
+
+        # Also try to find the notebook backing the registered model
+        try:
+            _mv = mlflow.MlflowClient().get_latest_versions(REGISTERED_MODEL_NAME, stages=["None"])
+            if _mv:
+                _run = mlflow.get_run(_mv[0].run_id)
+                _nb_path = _run.data.tags.get("mlflow.databricks.notebookPath", "")
+                if _nb_path:
+                    _nb_id = _run.data.tags.get("mlflow.databricks.notebookID", "")
+                    if _nb_id and _nb_id not in _notebook_ids:
+                        _notebook_ids.append(_nb_id)
+        except Exception:
+            pass
+
+        for _nb_id in _notebook_ids:
+            try:
+                _w2.permissions.update(
+                    "notebooks",
+                    _nb_id,
+                    access_control_list=[
+                        {
+                            "service_principal_name": _trace_principal,
+                            "permission_level": "CAN_RUN",
+                        }
+                    ],
+                )
+                _granted_items.append(f"notebook {_nb_id}")
+            except Exception as _nb_err:
+                print(f"  WARN: Could not grant notebook {_nb_id} permission: {_nb_err}")
+    except Exception as _nb_outer_err:
+        print(f"  WARN: Notebook permission grant failed: {_nb_outer_err}")
+
+    # ── Summary ───────────────────────────────────────────────────────
+    if _granted_items:
+        print(f"\nTrace permissions granted on: {', '.join(_granted_items)}")
+    else:
+        print("\nWARN: No trace permissions were granted. Traces may not be logged.")
+    print("Traces should now appear in the Serving UI → Traces tab.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
 # MAGIC ## Step 6: Test Deployed Endpoint
 
 # COMMAND ----------
