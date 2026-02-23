@@ -409,9 +409,9 @@ if not _endpoint_ready:
     print("WARNING: endpoint may not be ready yet. Continuing with grants anyway.\n")
 
 # ── Discover the serving principal ────────────────────────────────────
-# The agent has a built-in diagnostic: send "__DIAGNOSTIC_IDENTITY__" and
+# Use the agent's built-in diagnostic: send "__DIAGNOSTIC_IDENTITY__" and
 # it returns "SERVING_IDENTITY=<principal>" directly from SELECT current_user().
-# This bypasses the LLM entirely so we get the raw service principal name.
+# This bypasses the LLM so we get the raw system service principal UUID.
 serving_principal = None
 
 print("Querying endpoint for serving identity ...")
@@ -429,29 +429,29 @@ try:
         print(f"Discovered serving principal: {serving_principal}")
     else:
         print(f"Diagnostic returned: {_diag_content[:300]}")
-        print("Falling back to SDK lookup ...")
 except Exception as _e:
     print(f"Diagnostic call failed: {str(_e)[:300]}")
-    print("Falling back to SDK lookup ...")
 
-# ── Fallback: SDK-based principal discovery ───────────────────────────
+# ── Fallback: check endpoint build logs for current_user= ─────────────
 if serving_principal is None:
+    print("Checking endpoint logs for serving identity ...")
     try:
         from databricks.sdk import WorkspaceClient
         _w = WorkspaceClient()
         _ep = _w.serving_endpoints.get(name=AGENT_ENDPOINT)
-
-        # Check endpoint ACL for a service principal
-        _perms = _w.serving_endpoints.get_permissions(serving_endpoint_id=_ep.id)
-        for _acl in (_perms.access_control_list or []):
-            _sp = getattr(_acl, "service_principal_name", None)
-            if _sp:
-                serving_principal = _sp
-                print(f"Discovered serving principal from endpoint ACL: {serving_principal}")
-                break
-
+        # Search build logs for the current_user logged by _SQLWarehouseProxy
+        _logs = getattr(_ep, "pending_config", None) or _ep.config
+        _logs_str = str(_logs)
+        _log_match = re.search(r"current_user=([0-9a-f-]{36})", _logs_str)
+        if _log_match:
+            serving_principal = _log_match.group(1)
+            print(f"Discovered serving principal from endpoint config: {serving_principal}")
     except Exception as _sdk_err:
         print(f"  SDK lookup failed: {_sdk_err}")
+
+if serving_principal is None:
+    print("WARNING: Could not discover serving principal automatically.")
+    print("Check endpoint Logs tab for 'current_user=' and set serving_principal manually.")
 
 # ── Run the GRANT statements ─────────────────────────────────────────
 if serving_principal:

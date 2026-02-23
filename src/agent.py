@@ -23,7 +23,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import mlflow
 import mlflow.pyfunc
 from mlflow.deployments import get_deploy_client
-from mlflow.types.llm import ChatCompletionResponse
+from mlflow.types.llm import (
+    ChatCompletionResponse,
+    ChatCompletionChunk,
+    ChatChunkChoice,
+    ChatChoiceDelta,
+)
 
 from src.citation_engine import CitationEngine
 from src.financial_tools import (
@@ -1407,6 +1412,201 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             "if you need additional detail."
         )
 
+    @mlflow.trace(name="research_agent_stream")
+    def predict_stream(self, context, messages, params=None):
+        """Stream the agent's response chunk-by-chunk.
+
+        Runs the same tool-calling loop as predict(), yielding progress
+        messages during tool execution and streaming the final synthesis
+        in word-sized chunks.
+
+        Yields
+        ------
+        ChatCompletionChunk
+        """
+        # ── Extract custom inputs ────────────────────────────────────
+        custom = {}
+        if params:
+            if hasattr(params, "custom_inputs") and params.custom_inputs:
+                custom = params.custom_inputs
+            elif isinstance(params, dict) and "custom_inputs" in params:
+                custom = params["custom_inputs"]
+
+        ticker = custom.get("ticker")
+        active_doc_ids = custom.get("active_doc_ids")
+
+        # ── Build conversation with system prompt ────────────────────
+        system_content = SYSTEM_PROMPT
+        if ticker:
+            system_content += f"\n\n## Current Context\n- **Active ticker:** {ticker}"
+        if active_doc_ids:
+            system_content += (
+                f"\n- **Active document IDs:** {', '.join(active_doc_ids)}"
+            )
+
+        conversation = [{"role": "system", "content": system_content}]
+
+        for msg in messages:
+            if hasattr(msg, "to_dict"):
+                conversation.append(msg.to_dict())
+            elif isinstance(msg, dict):
+                conversation.append(msg)
+            else:
+                conversation.append({"role": msg.role, "content": msg.content})
+
+        # ── Extract last user message ────────────────────────────────
+        last_user_text = ""
+        for msg in reversed(messages):
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if role == "user" and content:
+                last_user_text = content
+                break
+
+        # ── Diagnostic: return SQL identity ──────────────────────────
+        if last_user_text.strip() == "__DIAGNOSTIC_IDENTITY__":
+            try:
+                rows = self.spark.sql("SELECT current_user() AS cu").collect()
+                identity = rows[0].asDict()["cu"] if rows else "UNKNOWN"
+            except Exception as e:
+                identity = f"ERROR: {e}"
+            yield _make_chunk(f"SERVING_IDENTITY={identity}")
+            return
+
+        # ── Pre-fetch: detect "full briefing" ────────────────────────
+        prefetch_ticker = ticker or _extract_ticker_from_text(last_user_text)
+        is_prefetched = False
+
+        if prefetch_ticker and _is_briefing_request(last_user_text):
+            with mlflow.start_span(name="prefetch_full_briefing") as pf_span:
+                pf_span.set_inputs({"ticker": prefetch_ticker})
+                prefetch_data = _execute_full_briefing(
+                    prefetch_ticker, self.engine, self.spark,
+                )
+                pf_span.set_outputs({"sections": list(prefetch_data.keys())})
+
+            briefing_md = _format_briefing_markdown(prefetch_data)
+
+            synth_call_id = "prefetch_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_full_briefing",
+                        "arguments": json.dumps({"ticker": prefetch_ticker}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": (
+                    "All data has been retrieved and pre-formatted below. "
+                    "Write a concise briefing report using ONLY this data. "
+                    "Include the pre-formatted tables as-is and add a short "
+                    "executive Summary at the top, brief Analysis narrative, "
+                    "and 2-3 Related Questions at the bottom. "
+                    "Do NOT call any more tools.\n\n"
+                    + briefing_md
+                ),
+            })
+            is_prefetched = True
+
+        # ── Tool-calling loop ────────────────────────────────────────
+        for round_num in range(MAX_TOOL_ROUNDS):
+            endpoint = LLM_ENDPOINT_FAST if is_prefetched else LLM_ENDPOINT
+
+            with mlflow.start_span(name=f"llm_call_{round_num}") as span:
+                span.set_inputs({
+                    "round": round_num,
+                    "message_count": len(conversation),
+                    "endpoint": endpoint,
+                })
+
+                response = self.client.predict(
+                    endpoint=endpoint,
+                    inputs={
+                        "messages": conversation,
+                        "tools": TOOLS,
+                        "max_tokens": 2048,
+                    },
+                )
+
+                choice = response["choices"][0]
+                message = choice["message"]
+                span.set_outputs({
+                    "finish_reason": choice.get("finish_reason"),
+                })
+
+            # If no tool calls, stream the final text
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                text = message.get("content", "")
+                # Stream in word-sized chunks for smooth rendering
+                words = text.split(" ")
+                for i, word in enumerate(words):
+                    suffix = " " if i < len(words) - 1 else ""
+                    yield _make_chunk(word + suffix)
+                return
+
+            # Append assistant message + execute tools
+            conversation.append(message)
+
+            def _run_tool(tc):
+                fn_name = tc["function"]["name"]
+                fn_args = json.loads(tc["function"]["arguments"])
+
+                if (
+                    ticker
+                    and "ticker" not in fn_args
+                    and "ticker" in _tool_param_names(fn_name)
+                ):
+                    fn_args["ticker"] = ticker
+
+                if (
+                    active_doc_ids
+                    and "doc_ids" not in fn_args
+                    and fn_name == "search_documents"
+                ):
+                    fn_args["doc_ids"] = active_doc_ids
+
+                with mlflow.start_span(name=f"tool_{fn_name}") as tspan:
+                    tspan.set_inputs(fn_args)
+                    try:
+                        tool_result = execute_tool(
+                            fn_name, fn_args, self.engine, self.spark,
+                        )
+                    except Exception as tool_err:
+                        tool_result = json.dumps({
+                            "error": str(tool_err),
+                            "tool": fn_name,
+                        })
+                    tspan.set_outputs({"result_length": len(tool_result)})
+
+                return tc["id"], tool_result
+
+            with ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
+                futures = {pool.submit(_run_tool, tc): tc for tc in tool_calls}
+                results = {}
+                for future in as_completed(futures):
+                    call_id, result = future.result()
+                    results[call_id] = result
+
+            for tc in tool_calls:
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": results[tc["id"]],
+                })
+
+        # Safety: hit max rounds
+        yield _make_chunk(
+            "I reached the maximum number of tool-calling rounds. "
+            "Please refine your question for additional detail."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1425,6 +1625,17 @@ def _build_response(content):
                 }
             ],
         }
+    )
+
+
+def _make_chunk(content):
+    """Create a single ChatCompletionChunk for streaming."""
+    return ChatCompletionChunk(
+        choices=[
+            ChatChunkChoice(
+                delta=ChatChoiceDelta(role="assistant", content=content),
+            )
+        ]
     )
 
 
