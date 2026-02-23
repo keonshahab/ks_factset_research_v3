@@ -47,6 +47,7 @@ from src.position_tools import (
     get_desk_pnl,
     get_risk_flags,
     get_position_summary,
+    get_top_holdings,
     get_desk_positions,
 )
 
@@ -679,6 +680,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_top_holdings",
+            "description": (
+                "Top N holdings across the entire portfolio ranked by absolute "
+                "notional. Does NOT require a ticker — use this when the user asks "
+                "about overall portfolio holdings, biggest positions, or top "
+                "exposures firm-wide. Optionally filter by desk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of holdings to return (default 10).",
+                    },
+                    "desk": {
+                        "type": "string",
+                        "description": "Optional desk filter (e.g. 'Equity Trading'). Omit for all desks.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_desk_positions",
             "description": (
                 "Full position detail for one desk: all positions with notional, "
@@ -1142,6 +1169,15 @@ def execute_tool(tool_name, arguments, engine, spark_session):
     elif tool_name == "get_position_summary":
         return json.dumps(
             get_position_summary(spark_session, arguments["ticker"]),
+            default=str,
+        )
+    elif tool_name == "get_top_holdings":
+        return json.dumps(
+            get_top_holdings(
+                spark_session,
+                top_n=arguments.get("top_n", 10),
+                desk=arguments.get("desk"),
+            ),
             default=str,
         )
     elif tool_name == "get_desk_positions":
