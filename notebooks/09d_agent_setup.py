@@ -4,11 +4,13 @@
 # MAGIC # 09d — Agent Setup & Deployment
 # MAGIC
 # MAGIC **Purpose:** Build, register, and deploy the FactSet Research Agent using
-# MAGIC Mosaic AI Agent Framework.  The agent orchestrates **14 tools** spanning
+# MAGIC Mosaic AI Agent Framework.  The agent orchestrates **15 tools** spanning
 # MAGIC document search (`CitationEngine`), financial analysis (`financial_tools`),
-# MAGIC and position / risk management (`position_tools`).
+# MAGIC position / risk management (`position_tools`), and a composite briefing tool.
 # MAGIC
-# MAGIC **LLM:** `system.ai.databricks-claude-sonnet-4-6` (Databricks-hosted — no API key required)
+# MAGIC **LLMs:**
+# MAGIC - `system.ai.databricks-claude-sonnet-4-6` — tool-calling & normal queries
+# MAGIC - `system.ai.databricks-claude-haiku-4-5` — fast briefing synthesis (pre-fetched requests)
 # MAGIC
 # MAGIC **Prerequisites:**
 # MAGIC - Notebooks `01`–`08` have been run (tables and vector indexes populated).
@@ -17,13 +19,19 @@
 # MAGIC
 # MAGIC **Architecture:**
 # MAGIC ```
-# MAGIC User question ──► Agent (Claude Sonnet 4.6) ──► Tool calls ──► Structured response
-# MAGIC                        │                          │
-# MAGIC                        ▼                          ▼
-# MAGIC                   System prompt              14 tools:
-# MAGIC                   (role, indexes,            • search_documents  (citation_engine)
-# MAGIC                    format rules,             • 8 financial_tools
-# MAGIC                    position check)           • 5 position_tools
+# MAGIC User question ──► Pre-fetch detection ──► Briefing? ─── Yes ──► Run all 12 sub-tasks
+# MAGIC                                               │                  in parallel, then
+# MAGIC                                               No                 synthesize with Haiku
+# MAGIC                                               │
+# MAGIC                                               ▼
+# MAGIC                                     Agent (Claude Sonnet 4.6)
+# MAGIC                                          │
+# MAGIC                                          ▼
+# MAGIC                                     Tool calls ──► 15 tools:
+# MAGIC                                                    • get_full_briefing   (composite)
+# MAGIC                                                    • search_documents    (citation_engine)
+# MAGIC                                                    • 8 financial_tools
+# MAGIC                                                    • 5 position_tools
 # MAGIC ```
 # MAGIC
 # MAGIC **Input:** `question`, `ticker`, `active_doc_ids`, `conversation_history`
@@ -124,7 +132,7 @@ print(f"Agent module:       {AGENT_MODULE_PATH}")
 # MAGIC ---
 # MAGIC ## Step 2: Verify Agent Module
 # MAGIC
-# MAGIC The agent class, system prompt, 14 tool definitions, and tool dispatcher
+# MAGIC The agent class, system prompt, 15 tool definitions, and tool dispatcher
 # MAGIC all live in `src/agent.py`.  This cell confirms the module loaded correctly.
 
 # COMMAND ----------

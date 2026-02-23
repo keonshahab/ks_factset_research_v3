@@ -23,12 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import mlflow
 import mlflow.pyfunc
 from mlflow.deployments import get_deploy_client
-from mlflow.types.llm import (
-    ChatCompletionResponse,
-    ChatCompletionChunk,
-    ChunkChoice,
-    DeltaMessage,
-)
+from mlflow.types.llm import ChatCompletionResponse
 
 from src.citation_engine import CitationEngine
 from src.financial_tools import (
@@ -1393,7 +1388,7 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
 
         Yields
         ------
-        ChatCompletionChunk
+        dict  (OpenAI-compatible chunk format)
         """
         # ── Extract custom inputs (same as predict) ───────────────────
         custom = {}
@@ -1511,15 +1506,15 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                 # Yield the response in chunks for streaming effect
                 chunk_size = 20  # ~20 chars per chunk
                 for i in range(0, len(text), chunk_size):
-                    yield ChatCompletionChunk(
-                        choices=[ChunkChoice(
-                            index=0,
-                            delta=DeltaMessage(
-                                role="assistant",
-                                content=text[i : i + chunk_size],
-                            ),
-                        )],
-                    )
+                    yield {
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": text[i : i + chunk_size],
+                            },
+                        }],
+                    }
                 return
 
             # Append assistant message + execute tools (same as predict)
