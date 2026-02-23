@@ -321,6 +321,7 @@ with mlflow.start_run(run_name="research_agent_v1") as run:
             "mlflow>=2.14",
             "databricks-sql-connector",
             "databricks-sdk",
+            "openai>=1.0",
         ],
         resources=resources,
     )
