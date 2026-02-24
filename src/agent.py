@@ -771,6 +771,32 @@ def _is_briefing_request(text: str) -> bool:
     return any(p in lower for p in _BRIEFING_PATTERNS)
 
 
+_TOP_HOLDINGS_PATTERNS = [
+    "top holdings", "top positions", "biggest positions",
+    "biggest holdings", "largest positions", "largest holdings",
+    "my portfolio", "my holdings", "my positions",
+    "portfolio overview", "portfolio summary",
+    "what do we hold", "what do i hold", "what are we holding",
+    "show me the portfolio", "show me the book",
+    "across the portfolio", "across the book",
+    "firm-wide", "firmwide", "all desks",
+]
+
+
+def _is_top_holdings_request(text: str) -> bool:
+    """Return True if the user is asking for portfolio-wide holdings."""
+    lower = text.lower()
+    return any(p in lower for p in _TOP_HOLDINGS_PATTERNS)
+
+
+def _extract_top_n(text: str) -> int:
+    """Extract the number of holdings requested (e.g. 'top 10' → 10)."""
+    match = re.search(r"\btop\s+(\d+)\b", text, re.IGNORECASE)
+    if match:
+        return min(int(match.group(1)), 50)
+    return 10
+
+
 def _extract_ticker_from_text(text: str) -> str | None:
     """Try to extract a ticker symbol from user text.
 
@@ -1384,6 +1410,38 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             })
             is_prefetched = True
 
+        # ── Pre-fetch: detect "top holdings" (no ticker needed) ──────
+        if not is_prefetched and _is_top_holdings_request(last_user_text):
+            top_n = _extract_top_n(last_user_text)
+            with mlflow.start_span(name="prefetch_top_holdings") as th_span:
+                th_span.set_inputs({"top_n": top_n})
+                holdings_result = get_top_holdings(self.spark, top_n=top_n)
+                th_span.set_outputs({"count": len(holdings_result.get("result", {}).get("holdings", []))})
+
+            synth_call_id = "prefetch_holdings_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_top_holdings",
+                        "arguments": json.dumps({"top_n": top_n}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": (
+                    "Portfolio holdings data retrieved. Present the results "
+                    "in a clear table format. Do NOT call any more tools.\n\n"
+                    + json.dumps(holdings_result, default=str)
+                ),
+            })
+            is_prefetched = True
+
         # ── Tool-calling loop ────────────────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):
             # Use the fast model for pre-fetched briefings (tables are
@@ -1584,7 +1642,40 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             })
             is_prefetched = True
 
-        # ── Tool-calling loop ────────────────────────────────────────
+        # ── Pre-fetch: detect "top holdings" (no ticker needed) ──────
+        if not is_prefetched and _is_top_holdings_request(last_user_text):
+            top_n = _extract_top_n(last_user_text)
+            logger.warning("predict_stream: pre-fetching top %d holdings", top_n)
+            with mlflow.start_span(name="prefetch_top_holdings") as th_span:
+                th_span.set_inputs({"top_n": top_n})
+                holdings_result = get_top_holdings(self.spark, top_n=top_n)
+                th_span.set_outputs({"count": len(holdings_result.get("result", {}).get("holdings", []))})
+
+            synth_call_id = "prefetch_holdings_001"
+            conversation.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": synth_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_top_holdings",
+                        "arguments": json.dumps({"top_n": top_n}),
+                    },
+                }],
+            })
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": synth_call_id,
+                "content": (
+                    "Portfolio holdings data retrieved. Present the results "
+                    "in a clear table format. Do NOT call any more tools.\n\n"
+                    + json.dumps(holdings_result, default=str)
+                ),
+            })
+            is_prefetched = True
+
+        # ── Tool-calling loop (streaming) ─────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):
             endpoint = LLM_ENDPOINT_FAST if is_prefetched else LLM_ENDPOINT
 
@@ -1595,35 +1686,92 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                     "endpoint": endpoint,
                 })
 
-                response = self.client.predict(
-                    endpoint=endpoint,
-                    inputs={
-                        "messages": conversation,
-                        "tools": TOOLS,
-                        "max_tokens": 4096,
-                    },
-                )
+                # Use OpenAI streaming client — tokens arrive as they're
+                # generated instead of waiting for the full response.
+                streamed_text = ""
+                tool_call_acc = {}  # index -> {id, type, function:{name, arguments}}
+                try:
+                    if self.openai_client is None:
+                        raise RuntimeError("no openai client")
+                    stream = self.openai_client.chat.completions.create(
+                        model=endpoint,
+                        messages=conversation,
+                        tools=TOOLS,
+                        max_tokens=4096,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        choice = chunk.choices[0] if chunk.choices else None
+                        if not choice:
+                            continue
+                        delta = choice.delta
 
-                choice = response["choices"][0]
-                message = choice["message"]
-                span.set_outputs({
-                    "finish_reason": choice.get("finish_reason"),
-                })
+                        # Stream text tokens to client immediately
+                        if delta.content:
+                            streamed_text += delta.content
+                            yield _make_chunk(delta.content)
 
-            # If no tool calls → return the final text
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                text = message.get("content", "")
-                words = text.split(" ")
-                for i, word in enumerate(words):
-                    suffix = " " if i < len(words) - 1 else ""
-                    yield _make_chunk(word + suffix)
+                        # Accumulate tool-call deltas (sent incrementally)
+                        if delta.tool_calls:
+                            for tc_delta in delta.tool_calls:
+                                idx = tc_delta.index
+                                if idx not in tool_call_acc:
+                                    tool_call_acc[idx] = {
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                if tc_delta.id:
+                                    tool_call_acc[idx]["id"] = tc_delta.id
+                                if tc_delta.function:
+                                    if tc_delta.function.name:
+                                        tool_call_acc[idx]["function"]["name"] = tc_delta.function.name
+                                    if tc_delta.function.arguments:
+                                        tool_call_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+
+                    span.set_outputs({"finish_reason": "stop" if not tool_call_acc else "tool_calls", "streamed": True})
+
+                except Exception as _stream_err:
+                    # Fallback: non-streaming via deploy client
+                    logger.warning("predict_stream: streaming failed (%s), falling back to deploy client", _stream_err)
+                    response = self.client.predict(
+                        endpoint=endpoint,
+                        inputs={
+                            "messages": conversation,
+                            "tools": TOOLS,
+                            "max_tokens": 4096,
+                        },
+                    )
+                    choice = response["choices"][0]
+                    message = choice["message"]
+                    span.set_outputs({"finish_reason": choice.get("finish_reason"), "streamed": False})
+
+                    fb_tool_calls = message.get("tool_calls")
+                    if not fb_tool_calls:
+                        text = message.get("content", "")
+                        words = text.split(" ")
+                        for i, word in enumerate(words):
+                            suffix = " " if i < len(words) - 1 else ""
+                            yield _make_chunk(word + suffix)
+                        return
+
+                    # Convert to same format as streaming accumulator
+                    for i, tc in enumerate(fb_tool_calls):
+                        tool_call_acc[i] = tc
+                    streamed_text = message.get("content") or ""
+
+            # If no tool calls → final text already streamed
+            if not tool_call_acc:
                 return
 
-            # Append assistant message + execute tools
-            conversation.append(message)
+            # Build tool_calls list from accumulated deltas
+            tool_calls = [tool_call_acc[i] for i in sorted(tool_call_acc.keys())]
+            conversation.append({
+                "role": "assistant",
+                "content": streamed_text or None,
+                "tool_calls": tool_calls,
+            })
 
-            # Emit a progress chunk so the connection stays alive
             tool_names = [tc["function"]["name"] for tc in tool_calls]
             logger.warning("predict_stream round %d: calling tools %s", round_num, tool_names)
 
