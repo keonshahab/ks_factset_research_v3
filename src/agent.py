@@ -1275,6 +1275,8 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
     def predict(self, context, messages, params=None):
         """Run the agent's tool-calling loop.
 
+        NOTE: predict_stream is preferred for interactive use (AI Playground).
+
         Parameters
         ----------
         context : mlflow.pyfunc.PythonModelContext
@@ -1481,14 +1483,15 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
         """Stream the agent's response token-by-token.
 
         Tool-calling rounds run non-streaming (we need the complete response
-        to extract tool calls).  The **final** synthesis call uses the OpenAI
-        SDK with ``stream=True`` so tokens arrive at the client in real time.
+        to extract tool calls).  The **final** text is chunked word-by-word
+        so tokens arrive at the client promptly.
 
         Yields
         ------
         ChatCompletionChunk
         """
         logger = logging.getLogger("FactSetResearchAgent")
+        logger.warning("predict_stream: incoming request with %d messages", len(messages))
 
         # ── Extract custom inputs ────────────────────────────────────
         custom = {}
@@ -1581,35 +1584,6 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
             })
             is_prefetched = True
 
-        # ── Helper: stream the final synthesis call via OpenAI SDK ───
-        def _stream_final(conv, ep):
-            """Yield ChatCompletionChunk objects from a streaming LLM call."""
-            if self.openai_client is not None:
-                try:
-                    stream = self.openai_client.chat.completions.create(
-                        model=ep,
-                        messages=conv,
-                        max_tokens=4096,
-                        stream=True,
-                    )
-                    for chunk in stream:
-                        if chunk.choices and chunk.choices[0].delta.content:
-                            yield _make_chunk(chunk.choices[0].delta.content)
-                    return
-                except Exception as stream_err:
-                    logger.warning("OpenAI streaming failed (%s), falling back", stream_err)
-
-            # Fallback: non-streaming call, split into word chunks
-            resp = self.client.predict(
-                endpoint=ep,
-                inputs={"messages": conv, "max_tokens": 4096},
-            )
-            text = resp["choices"][0]["message"].get("content", "")
-            words = text.split(" ")
-            for i, word in enumerate(words):
-                suffix = " " if i < len(words) - 1 else ""
-                yield _make_chunk(word + suffix)
-
         # ── Tool-calling loop ────────────────────────────────────────
         for round_num in range(MAX_TOOL_ROUNDS):
             endpoint = LLM_ENDPOINT_FAST if is_prefetched else LLM_ENDPOINT
@@ -1636,25 +1610,22 @@ class FactSetResearchAgent(mlflow.pyfunc.ChatModel):
                     "finish_reason": choice.get("finish_reason"),
                 })
 
-            # If no tool calls → stream the final synthesis
+            # If no tool calls → return the final text
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                # If this was NOT the first round (tools were used), make a
-                # dedicated streaming synthesis call so tokens arrive in
-                # real-time.  If this IS the first round, the response is
-                # already complete — just chunk it out.
-                if round_num > 0 and self.openai_client is not None:
-                    yield from _stream_final(conversation, endpoint)
-                else:
-                    text = message.get("content", "")
-                    words = text.split(" ")
-                    for i, word in enumerate(words):
-                        suffix = " " if i < len(words) - 1 else ""
-                        yield _make_chunk(word + suffix)
+                text = message.get("content", "")
+                words = text.split(" ")
+                for i, word in enumerate(words):
+                    suffix = " " if i < len(words) - 1 else ""
+                    yield _make_chunk(word + suffix)
                 return
 
             # Append assistant message + execute tools
             conversation.append(message)
+
+            # Emit a progress chunk so the connection stays alive
+            tool_names = [tc["function"]["name"] for tc in tool_calls]
+            logger.warning("predict_stream round %d: calling tools %s", round_num, tool_names)
 
             def _run_tool(tc):
                 fn_name = tc["function"]["name"]
